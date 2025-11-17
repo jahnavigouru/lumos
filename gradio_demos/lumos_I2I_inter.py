@@ -25,6 +25,7 @@ matplotlib.use('Agg')  # Use non-interactive backend
 
 INTERPOLATION = False
 INTERPRETATION = True
+INFO_GRAD = False
 
 MAX_SEED = 2147483647
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
@@ -37,6 +38,50 @@ def dividable(n):
         if n % i == 0:
             break
     return i, n // i
+
+def print_frozen_modules(model, model_name):
+    """
+    Print which modules have requires_grad=False (frozen parameters).
+    
+    Args:
+        model: PyTorch model
+        model_name: Name of the model for printing
+    """
+    print(f"\n{'='*60}")
+    print(f"Checking frozen parameters for: {model_name}")
+    print(f"{'='*60}")
+    
+    frozen_modules = []
+    trainable_modules = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            frozen_modules.append(name)
+        else:
+            trainable_modules.append(name)
+    
+    if frozen_modules:
+        print(f"\nFrozen modules (requires_grad=False): {len(frozen_modules)}")
+        print("-" * 60)
+        for name in frozen_modules[:20]:  # Print first 20
+            print(f"  {name}")
+        if len(frozen_modules) > 20:
+            print(f"  ... and {len(frozen_modules) - 20} more")
+    else:
+        print("\nNo frozen modules found (all parameters have requires_grad=True)")
+    
+    if trainable_modules:
+        print(f"\nTrainable modules (requires_grad=True): {len(trainable_modules)}")
+        print("-" * 60)
+        for name in trainable_modules[:20]:  # Print first 20
+            print(f"  {name}")
+        if len(trainable_modules) > 20:
+            print(f"  ... and {len(trainable_modules) - 20} more")
+    else:
+        print("\nNo trainable modules found (all parameters have requires_grad=False)")
+    
+    total_params = len(frozen_modules) + len(trainable_modules)
+    print(f"\nSummary: {len(frozen_modules)}/{total_params} frozen, {len(trainable_modules)}/{total_params} trainable")
 
 def create_combined_image_with_labels(input_image, output_image, output_path):
     """
@@ -71,7 +116,8 @@ def generate(
     guidance_scale=4.5,
     num_inference_steps=20,
     seed=10,
-    randomize_seed=True
+    randomize_seed=True,
+    method="multistep"
 ):
     seed = int(randomize_seed_fn(seed, randomize_seed))
     np.random.seed(seed)
@@ -112,7 +158,7 @@ def generate(
                 steps=num_inference_steps,
                 order=2,
                 skip_type="time_uniform",
-                method="multistep")
+                method=method)
         output = vae.decode(output / 0.18215).sample
         output = torch.clamp(output * 0.5 + 0.5, min=0, max=1).cpu()
         output = (
@@ -174,6 +220,12 @@ if __name__ == "__main__":
     model.to(weight_dtype)
     models["diffusion"] = model
     
+    if INFO_GRAD:
+        # Print frozen modules for all models
+        print_frozen_modules(vae, "VAE")
+        print_frozen_modules(dino, "DINO Vision Encoder")
+        print_frozen_modules(model, "LumosI2I Diffusion Model")
+    
     # Load images from input folder
     input_folder = os.path.join(os.path.dirname(__file__), "input")
     image1_path = os.path.join(input_folder, "n02099712_2668.JPEG")
@@ -201,27 +253,53 @@ if __name__ == "__main__":
     seed = 10
     randomize_seed = True
     
-    output = generate(
-        prompt_img1=prompt_img1,
-        prompt_img2=prompt_img2,
-        bsz=bsz,
-        guidance_scale=guidance_scale,
-        num_inference_steps=num_inference_steps,
-        seed=seed,
-        randomize_seed=randomize_seed
-    )
+    # All available methods
+    # methods = ["multistep", "singlestep", "singlestep_fixed", "adaptive"]
+    methods = ["adaptive"]
     
-    # Save output
-    output_image = Image.fromarray(output)
     output_folder = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(output_folder, exist_ok=True)
     
-    if INTERPRETATION:
-        # Create combined image with input and output side by side with labels
-        output_path = os.path.join(output_folder, output_filename)
-        create_combined_image_with_labels(prompt_img1, output_image, output_path)
-    else:
-        output_path = os.path.join(output_folder, output_filename)
-        output_image.save(output_path)
+    # Generate and save outputs for each method
+    for method in methods:
+        print(f"\n{'='*60}")
+        print(f"Generating with method: {method}")
+        print(f"{'='*60}")
+        
+        try:
+            output = generate(
+                prompt_img1=prompt_img1,
+                prompt_img2=prompt_img2,
+                bsz=bsz,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                seed=seed,
+                randomize_seed=randomize_seed,
+                method=method
+            )
+            
+            # Save output
+            output_image = Image.fromarray(output)
+            
+            # Create method-specific filename
+            base_name = output_filename.replace(".png", "")
+            method_output_filename = f"{base_name}_{method}.png"
+            output_path = os.path.join(output_folder, method_output_filename)
+            
+            if INTERPRETATION:
+                # Create combined image with input and output side by side with labels
+                create_combined_image_with_labels(prompt_img1, output_image, output_path)
+            else:
+                output_image.save(output_path)
+            
+            print(f"✓ Output saved to {output_path}")
+            
+        except Exception as e:
+            print(f"✗ Error with method {method}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
     
-    print(f"Output saved to {output_path}")
+    print(f"\n{'='*60}")
+    print("All methods completed!")
+    print(f"{'='*60}")
