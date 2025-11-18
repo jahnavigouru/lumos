@@ -28,7 +28,8 @@ from transformers import CLIPModel, CLIPProcessor
 INTERPOLATION = False
 INTERPRETATION = True
 INFO_GRAD = False
-LEARN_PERTURBATION = False
+LEARN_IMG_PERTURBATION = True
+LEARN_EMB_PERTURBATION = False
 _CLIP_PROMPTS = [
     "a fluffy dog",
     "a black dog",
@@ -47,6 +48,39 @@ def dividable(n):
         if n % i == 0:
             break
     return i, n // i
+
+def create_transform(learn_img_perturbation=False):
+    if not learn_img_perturbation:
+        return [
+            T.Lambda(lambda img: img.convert('RGB')),
+            T.Resize(224),  # Image.BICUBIC
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    else:
+        return [
+            T.Lambda(lambda img: img.convert('RGB')),
+            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+            T.RandomHorizontalFlip(p=0.5),
+            T.Resize(224),  # Image.BICUBIC
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+
+
+def tensor_to_display_image(tensor):
+    """
+    Convert a normalized tensor (C, H, W) back to a displayable PIL image.
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=tensor.dtype, device=tensor.device).view(3, 1, 1)
+    img = tensor.clone()
+    img = img * std + mean
+    img = torch.clamp(img, 0, 1)
+    img = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    return Image.fromarray(img)
 
 def freeze_model_parameters(model):
     """
@@ -128,6 +162,52 @@ def create_combined_image_with_labels(input_image, output_image, output_path):
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
+def create_interpretation_grid(original_input, original_output, augmented_input=None, augmented_output=None, output_path=None):
+    # Helper function to convert image to displayable format (no resizing)
+    def to_displayable(img):
+        if isinstance(img, Image.Image):
+            return img
+        elif isinstance(img, torch.Tensor):
+            # Convert tensor to numpy array for matplotlib
+            if img.dim() == 4:
+                img = img.squeeze(0)
+            # Images from generate() are in [0, 1] range, so multiply by 255
+            img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            return img_np
+        else:
+            # numpy array
+            return img
+    
+    grid_items = [
+        (original_input, 'Input Image'),
+        (original_output, 'Output Image'),
+    ]
+
+    if augmented_input is not None and augmented_output is not None:
+        grid_items.extend([
+            (augmented_input, 'Augmented Image'),
+            (augmented_output, 'Augmented Output'),
+        ])
+
+    rows = 2 if len(grid_items) > 2 else 1
+    cols = 2
+    figsize = (12, 6 * rows)
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+
+    axes_list = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+
+    for ax, (img, title) in zip(axes_list, grid_items):
+        ax.imshow(to_displayable(img))
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.axis('off')
+
+    for extra_ax in axes_list[len(grid_items):]:
+        extra_ax.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
 def generate(
     prompt_img1,
     prompt_img2=None,
@@ -136,18 +216,27 @@ def generate(
     num_inference_steps=20,
     seed=10,
     randomize_seed=True,
-    method="multistep"
+    method="multistep",
+    INTERPRETATION=True,
+    img_per=False
 ):
     seed = int(randomize_seed_fn(seed, randomize_seed))
     np.random.seed(seed)
     torch.random.manual_seed(seed)
-    vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
-    prompt_img1 = transform(prompt_img1).unsqueeze(0)
+    vae, dino, model = models["vae"], models["vision_encoder"], models["diffusion"]
+    
+    # Create transform based on img_per argument
+    cur_transform = T.Compose(create_transform(learn_img_perturbation=img_per))
+
+    # Apply transform to prompt_img1 (always needed for DINO preprocessing) and save a displayable copy
+    prompt_img1_tensor = cur_transform(prompt_img1)
+    display_input_image = tensor_to_display_image(prompt_img1_tensor)
+    prompt_img1 = prompt_img1_tensor.unsqueeze(0)
     
     with torch.no_grad():
         if INTERPOLATION and prompt_img2 is not None:
             # INTERPOLATION mode: use two images and create interpolated embeddings
-            prompt_img2 = transform(prompt_img2).unsqueeze(0)
+            prompt_img2 = cur_transform(prompt_img2).unsqueeze(0)
             prompt_imgs = torch.cat([prompt_img1, prompt_img2], dim=0)
             caption_embs = dino(prompt_imgs.to(device))
             caption_embs = torch.nn.functional.normalize(caption_embs, dim=-1).unsqueeze(1).unsqueeze(1)
@@ -157,15 +246,10 @@ def generate(
             caption_embs = [caption_emb2 * wei + caption_emb1 * (1-wei) for wei in weights]
             caption_embs = torch.stack(caption_embs).to(device)
         else:
-            # INTERPRETATION mode: use only one image and create its embedding
+            # Always use original image for main output
             prompt_imgs = prompt_img1
             caption_emb = dino(prompt_imgs.to(device))
             caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
-            testing = torch.randn_like(caption_emb) * 0.01
-            print(f"Testing embedding shape: {testing.shape}")
-            print(f"Testing embedding norm: {torch.norm(testing).item():.6f}")
-            print(f"Testing embedding stats - min: {testing.min().item():.6f}, max: {testing.max().item():.6f}, mean: {testing.mean().item():.6f}")
-            caption_emb = caption_emb + testing
             caption_embs = caption_emb.repeat(bsz, 1, 1, 1).to(device)
         
         bsz = caption_embs.shape[0]
@@ -186,10 +270,14 @@ def generate(
                 enable_grad=False)
         output = vae.decode(output / 0.18215).sample
         output = torch.clamp(output * 0.5 + 0.5, min=0, max=1).cpu()
-        output = (
-            make_grid(output, nrow=output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
-        ).astype(np.uint8)
-        return output
+        
+        if INTERPRETATION:
+            return display_input_image, output
+        else:
+            output = (
+                make_grid(output, nrow=output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
+            ).astype(np.uint8)
+            return output
 
 def generate_perturbed_image(
     embeddings,
@@ -496,16 +584,7 @@ if __name__ == "__main__":
     del state_dict
     dino.eval()
     models["vision_encoder"] = dino
-    ## transform for vision encoder
-    transform = [
-            T.Lambda(lambda img: img.convert('RGB')),
-            T.Resize(224),  # Image.BICUBIC
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
-
-    transform = T.Compose(transform)
+    transform = T.Compose(create_transform(learn_img_perturbation=LEARN_IMG_PERTURBATION))
     models["transform"] = transform
     ## diffusion model
     model_kwargs={"window_block_indexes": [], "window_size": 0, 
@@ -536,10 +615,10 @@ if __name__ == "__main__":
     prompt_img1 = Image.open(image1_path)
     prompt_img2 = None
     
-    if LEARN_PERTURBATION:
-        # LEARN_PERTURBATION mode: optimize variant_axes using CLIP loss
+    if LEARN_EMB_PERTURBATION:
+        # LEARN_EMB_PERTURBATION mode: optimize variant_axes using CLIP loss
         print(f"\n{'='*60}")
-        print("LEARN_PERTURBATION mode: Optimizing variant_axes")
+        print("LEARN_EMB_PERTURBATION mode: Optimizing variant_axes")
         print(f"{'='*60}")
         
         target_index = 1  # Target prompt index (can be changed)
@@ -584,9 +663,9 @@ if __name__ == "__main__":
         bsz = 1
         output_filename = "output_interpretation.png"
     else:
-        raise ValueError("Either INTERPOLATION, INTERPRETATION, or LEARN_PERTURBATION must be True")
+        raise ValueError("Either INTERPOLATION, INTERPRETATION, or LEARN_EMB_PERTURBATION must be True")
     
-    if not LEARN_PERTURBATION:
+    if not LEARN_EMB_PERTURBATION:
         # Generate images
         guidance_scale = 4.5
         num_inference_steps = 20
@@ -607,19 +686,45 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             
             try:
-                output = generate(
-                    prompt_img1=prompt_img1,
-                    prompt_img2=prompt_img2,
-                    bsz=bsz,
-                    guidance_scale=guidance_scale,
-                    num_inference_steps=num_inference_steps,
-                    seed=seed,
-                    randomize_seed=randomize_seed,
-                    method=method
-                )
-                
-                # Save output
-                output_image = Image.fromarray(output)
+                if INTERPRETATION and LEARN_IMG_PERTURBATION:
+                    original_input, original_output = generate(
+                        prompt_img1=prompt_img1,
+                        prompt_img2=prompt_img2,
+                        bsz=bsz,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps,
+                        seed=seed,
+                        randomize_seed=randomize_seed,
+                        method=method,
+                        INTERPRETATION=INTERPRETATION,
+                        img_per=False
+                    )
+
+                    augmented_input, augmented_output = generate(
+                        prompt_img1=prompt_img1,
+                        prompt_img2=prompt_img2,
+                        bsz=bsz,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps,
+                        seed=seed,
+                        randomize_seed=randomize_seed,
+                        method=method,
+                        INTERPRETATION=INTERPRETATION,
+                        img_per=True
+                    )
+                else:
+                    result_input, result_output = generate(
+                        prompt_img1=prompt_img1,
+                        prompt_img2=prompt_img2,
+                        bsz=bsz,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps,
+                        seed=seed,
+                        randomize_seed=randomize_seed,
+                        method=method,
+                        INTERPRETATION=INTERPRETATION,
+                        img_per=False
+                    )
                 
                 # Create method-specific filename
                 base_name = output_filename.replace(".png", "")
@@ -627,9 +732,33 @@ if __name__ == "__main__":
                 output_path = os.path.join(output_folder, method_output_filename)
                 
                 if INTERPRETATION:
-                    # Create combined image with input and output side by side with labels
-                    create_combined_image_with_labels(prompt_img1, output_image, output_path)
+                    if LEARN_IMG_PERTURBATION:
+                        create_interpretation_grid(
+                            original_input=original_input,
+                            original_output=original_output,
+                            augmented_input=augmented_input,
+                            augmented_output=augmented_output,
+                            output_path=output_path,
+                        )
+                    else:
+                        create_interpretation_grid(
+                            original_input=result_input,
+                            original_output=result_output,
+                            augmented_input=None,
+                            augmented_output=None,
+                            output_path=output_path,
+                        )
                 else:
+                    if LEARN_IMG_PERTURBATION:
+                        output = (
+                            make_grid(augmented_output, nrow=augmented_output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
+                        ).astype(np.uint8)
+                        output_image = Image.fromarray(output)
+                    else:
+                        output = (
+                            make_grid(result_output, nrow=result_output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
+                        ).astype(np.uint8)
+                        output_image = Image.fromarray(output)
                     output_image.save(output_path)
                 
                 print(f"✓ Output saved to {output_path}")
