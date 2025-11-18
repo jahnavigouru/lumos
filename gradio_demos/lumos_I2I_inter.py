@@ -26,10 +26,10 @@ matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
 
 INTERPOLATION = False
-INTERPRETATION = True
+INTERPRETATION = False
 INFO_GRAD = False
-LEARN_IMG_PERTURBATION = True
-LEARN_EMB_PERTURBATION = False
+LEARN_IMG_PERTURBATION = False
+LEARN_EMB_PERTURBATION = True
 _CLIP_PROMPTS = [
     "a fluffy dog",
     "a black dog",
@@ -49,26 +49,103 @@ def dividable(n):
             break
     return i, n // i
 
+
+class BlockMasking(object):
+    def __init__(self, mask_ratio=0.40, block_size=32, avoid_neighbors=True):
+        self.mask_ratio = mask_ratio
+        self.block_size = block_size
+        self.avoid_neighbors = avoid_neighbors
+
+    def __call__(self, img):
+        # img: tensor (C, H, W)
+        C, H, W = img.shape
+        num_blocks_h = H // self.block_size
+        num_blocks_w = W // self.block_size
+
+        total_blocks = num_blocks_h * num_blocks_w
+        num_mask = int(total_blocks * self.mask_ratio)
+
+        mask = torch.ones((num_blocks_h, num_blocks_w), device=img.device, dtype=img.dtype)
+        chosen = set()
+
+        def has_neighbor(r, c):
+            for rr, cc in chosen:
+                if abs(rr - r) <= 1 and abs(cc - c) <= 1:
+                    return True
+            return False
+
+        all_positions = torch.randperm(total_blocks, device=img.device)
+
+        for idx in all_positions:
+            if len(chosen) >= num_mask:
+                break
+
+            r = idx // num_blocks_w
+            c = idx % num_blocks_w
+
+            if self.avoid_neighbors and has_neighbor(int(r), int(c)):
+                continue
+
+            chosen.add((int(r), int(c)))
+
+        for (r, c) in chosen:
+            mask[r, c] = 0
+
+        print(
+            f"BlockMasking: mask_ratio={self.mask_ratio:.2f}, "
+            f"total_blocks={total_blocks}, masked_blocks={len(chosen)}"
+        )
+
+        mask = mask.repeat_interleave(self.block_size, dim=0)
+        mask = mask.repeat_interleave(self.block_size, dim=1)
+        mask = mask.unsqueeze(0)  # (1,H,W)
+
+        return img * mask
+
+
+def add_gaussian_noise(img, mean=0.0, std=0.1):
+    noise = torch.randn_like(img) * std + mean
+    return torch.clamp(img + noise, 0.0, 1.0)
+
+
+def random_crop_original_minus(img, shrink=50):
+    w, h = img.size
+    crop_size = max(1, min(w, h) - shrink)
+    if crop_size <= 0:
+        return img
+    if crop_size >= min(w, h):
+        return img
+    max_left = w - crop_size
+    max_top = h - crop_size
+    left = random.randint(0, max_left) if max_left > 0 else 0
+    top = random.randint(0, max_top) if max_top > 0 else 0
+    return img.crop((left, top, left + crop_size, top + crop_size))
+
+
 def create_transform(learn_img_perturbation=False):
     if not learn_img_perturbation:
         return [
             T.Lambda(lambda img: img.convert('RGB')),
-            T.Resize(224),  # Image.BICUBIC
+            T.Resize(224), 
             T.CenterCrop(224),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     else:
+        mask_op = BlockMasking(mask_ratio=0.10, block_size=36)
         return [
             T.Lambda(lambda img: img.convert('RGB')),
-            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-            T.RandomHorizontalFlip(p=0.5),
-            T.Resize(224),  # Image.BICUBIC
+            T.Lambda(lambda img: random_crop_original_minus(img, shrink=50)),
+            # T.ColorJitter(brightness=0.6, contrast=0.1, saturation=0.1, hue=0.05),
+            # T.RandomHorizontalFlip(p=0.5),
+            T.Resize(224), 
             T.CenterCrop(224),
             T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            # T.Lambda(add_gaussian_noise),
+            # T.Lambda(lambda img: mask_op(img)),
+            T.Normalize([0.485, 0.456, 0.406],
+                        [0.229, 0.224, 0.225]),
         ]
-
 
 def tensor_to_display_image(tensor):
     """
@@ -606,27 +683,32 @@ if __name__ == "__main__":
         print_frozen_modules(dino, "DINO Vision Encoder")
         print_frozen_modules(model, "LumosI2I Diffusion Model")
     
-    # Load images from input folder
+    # Build list of input images
     input_folder = os.path.join(os.path.dirname(__file__), "input")
-    image1_path = os.path.join(input_folder, "n02099712_2668.JPEG")
     image2_path = os.path.join(input_folder, "n02099712_8719.JPEG")
-    
-    # Load the images based on mode
-    prompt_img1 = Image.open(image1_path)
-    prompt_img2 = None
-    
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
+    input_image_paths = sorted(
+        os.path.join(input_folder, f)
+        for f in os.listdir(input_folder)
+        if os.path.isfile(os.path.join(input_folder, f)) and os.path.splitext(f)[1].lower() in valid_exts
+    )
+    if not input_image_paths:
+        raise FileNotFoundError(f"No valid images found in {input_folder}")
+
+    output_root = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(output_root, exist_ok=True)
+    aug_folder = os.path.join(output_root, "aug")
+    os.makedirs(aug_folder, exist_ok=True)
+
     if LEARN_EMB_PERTURBATION:
-        # LEARN_EMB_PERTURBATION mode: optimize variant_axes using CLIP loss
         print(f"\n{'='*60}")
         print("LEARN_EMB_PERTURBATION mode: Optimizing variant_axes")
         print(f"{'='*60}")
-        
+
         target_index = 1  # Target prompt index (can be changed)
-        
-        # Create output folder for saving iteration images
-        output_folder = os.path.join(os.path.dirname(__file__), "output")
-        os.makedirs(output_folder, exist_ok=True)
-        
+        base_image_path = input_image_paths[0]
+        prompt_img1 = Image.open(base_image_path)
+
         generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
             prompt_img1=prompt_img1,
             target_index=target_index,
@@ -636,139 +718,144 @@ if __name__ == "__main__":
             num_iterations=10,
             learning_rate=0.01,
             l2_reg_weight=0.01,
-            output_folder=output_folder  # Pass output folder to save iteration images
+            output_folder=output_root  # Pass output folder to save iteration images
         )
-        
-        # Convert generated image to PIL and save
+
         generated_image_np = (generated_image[0].cpu().detach().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         output_image = Image.fromarray(generated_image_np)
-        
-        output_path = os.path.join(output_folder, "output_perturbed.png")
-        
-        # Create combined image with input and output
+        output_path = os.path.join(aug_folder, "output_perturbed.png")
+
         create_combined_image_with_labels(prompt_img1, output_image, output_path)
-        
+
         print(f"✓ Output saved to {output_path}")
-        print(f"✓ Saved {len(iteration_images)} iteration images to {os.path.join(output_folder, 'iterations')}")
+        print(f"✓ Saved {len(iteration_images)} iteration images to {os.path.join(output_root, 'iterations')}")
         print(f"Final loss: {loss_history[-1]:.4f}")
         print(f"{'='*60}\n")
-        
-    elif INTERPOLATION:
-        # INTERPOLATION mode: load both images
-        prompt_img2 = Image.open(image2_path)
-        bsz = 12
-        output_filename = "output_interpolation.png"
-    elif INTERPRETATION:
-        # INTERPRETATION mode: use only one image
-        bsz = 1
-        output_filename = "output_interpretation.png"
+        prompt_img1.close()
     else:
-        raise ValueError("Either INTERPOLATION, INTERPRETATION, or LEARN_EMB_PERTURBATION must be True")
-    
-    if not LEARN_EMB_PERTURBATION:
-        # Generate images
+        prompt_img2 = None
+        if INTERPOLATION:
+            prompt_img2 = Image.open(image2_path)
+            bsz = 12
+            output_filename_base = "output_interpolation"
+        elif INTERPRETATION:
+            bsz = 1
+            output_filename_base = "output_interpretation"
+        else:
+            raise ValueError("Either INTERPOLATION, INTERPRETATION, or LEARN_EMB_PERTURBATION must be True")
+
         guidance_scale = 4.5
         num_inference_steps = 20
         seed = 10
         randomize_seed = True
-        
-        # All available methods
-        # methods = ["multistep", "singlestep", "singlestep_fixed", "adaptive"]
         methods = ["multistep"]
-        
-        output_folder = os.path.join(os.path.dirname(__file__), "output")
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # Generate and save outputs for each method
-        for method in methods:
-            print(f"\n{'='*60}")
-            print(f"Generating with method: {method}")
-            print(f"{'='*60}")
-            
-            try:
-                if INTERPRETATION and LEARN_IMG_PERTURBATION:
-                    original_input, original_output = generate(
-                        prompt_img1=prompt_img1,
-                        prompt_img2=prompt_img2,
-                        bsz=bsz,
-                        guidance_scale=guidance_scale,
-                        num_inference_steps=num_inference_steps,
-                        seed=seed,
-                        randomize_seed=randomize_seed,
-                        method=method,
-                        INTERPRETATION=INTERPRETATION,
-                        img_per=False
-                    )
 
-                    augmented_input, augmented_output = generate(
-                        prompt_img1=prompt_img1,
-                        prompt_img2=prompt_img2,
-                        bsz=bsz,
-                        guidance_scale=guidance_scale,
-                        num_inference_steps=num_inference_steps,
-                        seed=seed,
-                        randomize_seed=randomize_seed,
-                        method=method,
-                        INTERPRETATION=INTERPRETATION,
-                        img_per=True
-                    )
-                else:
-                    result_input, result_output = generate(
-                        prompt_img1=prompt_img1,
-                        prompt_img2=prompt_img2,
-                        bsz=bsz,
-                        guidance_scale=guidance_scale,
-                        num_inference_steps=num_inference_steps,
-                        seed=seed,
-                        randomize_seed=randomize_seed,
-                        method=method,
-                        INTERPRETATION=INTERPRETATION,
-                        img_per=False
-                    )
-                
-                # Create method-specific filename
-                base_name = output_filename.replace(".png", "")
-                method_output_filename = f"{base_name}_{method}.png"
-                output_path = os.path.join(output_folder, method_output_filename)
-                
-                if INTERPRETATION:
-                    if LEARN_IMG_PERTURBATION:
-                        create_interpretation_grid(
-                            original_input=original_input,
-                            original_output=original_output,
-                            augmented_input=augmented_input,
-                            augmented_output=augmented_output,
-                            output_path=output_path,
+        def process_generation(prompt_img1, image_tag=None, target_folder=aug_folder):
+            safe_tag = image_tag.replace(" ", "_") if image_tag else None
+            image_label = safe_tag or "default input"
+            base_name = output_filename_base if not safe_tag else f"{output_filename_base}_{safe_tag}"
+
+            for method in methods:
+                print(f"\n{'='*60}")
+                print(f"Generating with method: {method} (image: {image_label})")
+                print(f"{'='*60}")
+
+                try:
+                    if INTERPRETATION and LEARN_IMG_PERTURBATION:
+                        original_input, original_output = generate(
+                            prompt_img1=prompt_img1,
+                            prompt_img2=prompt_img2,
+                            bsz=bsz,
+                            guidance_scale=guidance_scale,
+                            num_inference_steps=num_inference_steps,
+                            seed=seed,
+                            randomize_seed=randomize_seed,
+                            method=method,
+                            INTERPRETATION=INTERPRETATION,
+                            img_per=False
+                        )
+
+                        augmented_input, augmented_output = generate(
+                            prompt_img1=prompt_img1,
+                            prompt_img2=prompt_img2,
+                            bsz=bsz,
+                            guidance_scale=guidance_scale,
+                            num_inference_steps=num_inference_steps,
+                            seed=seed,
+                            randomize_seed=randomize_seed,
+                            method=method,
+                            INTERPRETATION=INTERPRETATION,
+                            img_per=True
                         )
                     else:
-                        create_interpretation_grid(
-                            original_input=result_input,
-                            original_output=result_output,
-                            augmented_input=None,
-                            augmented_output=None,
-                            output_path=output_path,
+                        result_input, result_output = generate(
+                            prompt_img1=prompt_img1,
+                            prompt_img2=prompt_img2,
+                            bsz=bsz,
+                            guidance_scale=guidance_scale,
+                            num_inference_steps=num_inference_steps,
+                            seed=seed,
+                            randomize_seed=randomize_seed,
+                            method=method,
+                            INTERPRETATION=INTERPRETATION,
+                            img_per=False
                         )
-                else:
-                    if LEARN_IMG_PERTURBATION:
-                        output = (
-                            make_grid(augmented_output, nrow=augmented_output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
-                        ).astype(np.uint8)
-                        output_image = Image.fromarray(output)
+
+                    method_output_filename = f"{base_name}_{method}.png"
+                    output_path = os.path.join(target_folder, method_output_filename)
+
+                    if INTERPRETATION:
+                        if LEARN_IMG_PERTURBATION:
+                            create_interpretation_grid(
+                                original_input=original_input,
+                                original_output=original_output,
+                                augmented_input=augmented_input,
+                                augmented_output=augmented_output,
+                                output_path=output_path,
+                            )
+                        else:
+                            create_interpretation_grid(
+                                original_input=result_input,
+                                original_output=result_output,
+                                augmented_input=None,
+                                augmented_output=None,
+                                output_path=output_path,
+                            )
                     else:
-                        output = (
-                            make_grid(result_output, nrow=result_output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
-                        ).astype(np.uint8)
-                        output_image = Image.fromarray(output)
-                    output_image.save(output_path)
-                
-                print(f"✓ Output saved to {output_path}")
-                
-            except Exception as e:
-                print(f"✗ Error with method {method}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
+                        if LEARN_IMG_PERTURBATION:
+                            output = (
+                                make_grid(augmented_output, nrow=augmented_output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
+                            ).astype(np.uint8)
+                            output_image = Image.fromarray(output)
+                        else:
+                            output = (
+                                make_grid(result_output, nrow=result_output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
+                            ).astype(np.uint8)
+                            output_image = Image.fromarray(output)
+                        output_image.save(output_path)
+
+                    print(f"✓ Output saved to {output_path} (image: {image_label})")
+
+                except Exception as e:
+                    print(f"✗ Error with method {method} (image: {image_label}): {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+        if LEARN_IMG_PERTURBATION:
+            for image_path in input_image_paths:
+                prompt_img1 = Image.open(image_path)
+                image_tag = os.path.splitext(os.path.basename(image_path))[0]
+                process_generation(prompt_img1, image_tag=image_tag, target_folder=aug_folder)
+                prompt_img1.close()
+        else:
+            prompt_img1 = Image.open(input_image_paths[0])
+            process_generation(prompt_img1, target_folder=aug_folder)
+            prompt_img1.close()
+
+        if prompt_img2 is not None:
+            prompt_img2.close()
+
         print(f"\n{'='*60}")
         print("All methods completed!")
         print(f"{'='*60}")
