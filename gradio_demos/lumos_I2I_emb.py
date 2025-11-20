@@ -98,12 +98,10 @@ def optimize_perturbed_image(
 ):
     vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
     
-    # Ensure all models are frozen
     freeze_model_parameters(vae)
     freeze_model_parameters(dino)
     freeze_model_parameters(model)
     
-    # Load CLIP model and processor
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     clip_model.eval()
