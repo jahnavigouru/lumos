@@ -23,7 +23,7 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
 from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform
-from loss import DirectionLoss, CLIPLoss
+from loss import DirectionLoss, CLIPLoss, LPIPSLoss
 
 src_txt = "a white dog"
 trg_txt = "a black dog"
@@ -32,7 +32,7 @@ def generate_perturbed_image(
     embeddings,
     guidance_scale=4.5,
     seed=10,
-    enable_grad=False
+    enable_grad=True
 ):
     vae, model = models["vae"], models["diffusion"]
     
@@ -71,10 +71,16 @@ def compute_clip_loss(
     clip_model,
     processor,
     device=None,
-    lambda_direction=1.0
+    lambda_direction=1.0,
+    variant_axes=None,
+    l2_reg_weight=0.02
 ):
     x0 = original_image
     x = generated_image
+
+    loss_clip_w = 5
+    loss_l1_w = 0.3
+    loss_id_w = 0.5
 
     clip_loss_func = CLIPLoss(clip_model, processor, loss_type='cosine', lambda_direction=lambda_direction)
     clip_loss_value = clip_loss_func(x0, src_txt, x, trg_txt, device=device)
@@ -83,8 +89,17 @@ def compute_clip_loss(
     loss_clip = -torch.log(loss_clip)
     
     loss_l1 = nn.L1Loss()(x0, x)
+
+    # Identity preservation using LPIPS
+    lpips_device = device if device is not None else x0.device
+    lpips_metric = LPIPSLoss().to(lpips_device)
+    loss_id = lpips_metric(x0.to(lpips_device), x.to(lpips_device))
     
-    total_loss = 3 * loss_clip + 0.1 * loss_l1
+    total_loss = loss_clip_w * loss_clip + loss_l1_w * loss_l1 + loss_id_w * loss_id
+    
+    if variant_axes is not None and l2_reg_weight > 0:
+        l2_reg_loss = l2_reg_weight * torch.norm(variant_axes) ** 2
+        total_loss = total_loss + l2_reg_loss
     
     return total_loss
 
@@ -93,7 +108,8 @@ def optimize_perturbed_image(
     guidance_scale=4.5,
     seed=10,
     num_iterations=10,
-    learning_rate=0.01,
+    learning_rate=0.005,
+    max_variant_norm=0.1,
     output_folder=None
 ):
     vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
@@ -129,7 +145,7 @@ def optimize_perturbed_image(
     print(f"Training variant_axes for {num_iterations} iterations")
     print(f"Source text: {src_txt}")
     print(f"Target text: {trg_txt}")
-    print(f"Learning rate: {learning_rate}")
+    print(f"Learning rate: {learning_rate}, max variant norm: {max_variant_norm}")
     print(f"{'='*60}\n")
     
     # Generate original image from original embedding for comparison
@@ -138,8 +154,14 @@ def optimize_perturbed_image(
             embeddings=caption_emb,
             guidance_scale=guidance_scale,
             seed=seed,
-            enable_grad=False
+            enable_grad=True
         )
+        if output_folder is not None:
+            iter_image_copy = original_image[0].clone().cpu()
+            iter_image_np = (iter_image_copy.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            iter_image_pil = Image.fromarray(iter_image_np)
+            iter_image_path = os.path.join(iteration_folder, "iteration_000.png")
+            iter_image_pil.save(iter_image_path)
     
     for iteration in range(num_iterations):
         optimizer.zero_grad()
@@ -151,7 +173,7 @@ def optimize_perturbed_image(
             embeddings=perturbed_emb,
             guidance_scale=guidance_scale,
             seed=seed,
-            enable_grad=False
+            enable_grad=True
         )
         
         total_loss = compute_clip_loss(
@@ -159,12 +181,18 @@ def optimize_perturbed_image(
             generated_image=generated_image,
             clip_model=clip_model,
             processor=processor,
-            device=device
+            device=device,
+            variant_axes=variant_axes
         )
         
         total_loss.backward()
         
         optimizer.step()
+        if max_variant_norm is not None:
+            with torch.no_grad():
+                current_norm = variant_axes.norm()
+                if current_norm > max_variant_norm:
+                    variant_axes.mul_(max_variant_norm / (current_norm + 1e-6))
          
         loss_history.append(total_loss.item())
         
@@ -258,15 +286,16 @@ if __name__ == "__main__":
     print("Optimizing variant_axes")
     print(f"{'='*60}")
 
-    base_image_path = input_image_paths[0]
+    base_image_path = os.path.join(input_folder, "n02111889_7148.JPEG")
     prompt_img1 = Image.open(base_image_path)
 
     generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
         prompt_img1=prompt_img1,
         guidance_scale=4.5,
         seed=10,
-        num_iterations=10,
-        learning_rate=0.01,
+        num_iterations=60,
+        learning_rate=0.005,
+        max_variant_norm=0.1,
         output_folder=output_root
     )
 
@@ -281,4 +310,3 @@ if __name__ == "__main__":
     print(f"Final loss: {loss_history[-1]:.4f}")
     print(f"{'='*60}\n")
     prompt_img1.close()
-

@@ -25,16 +25,9 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
 
-INTERPOLATION = False
-INTERPRETATION = True
+INTERPOLATION = True
+INTERPRETATION = False
 LEARN_IMG_PERTURBATION = False
-LEARN_EMB_PERTURBATION = False
-_CLIP_PROMPTS = [
-    "a fluffy dog",
-    "a black dog",
-    "a dog with blue eyes",
-    "a dog with long ears",
-]
 
 MAX_SEED = 2147483647
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
@@ -274,8 +267,8 @@ def generate(
             prompt_imgs = prompt_img1
             caption_emb = dino(prompt_imgs.to(device))
             caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
-            test = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
-            caption_emb = caption_emb + test
+            # test = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
+            # caption_emb = caption_emb + test
             caption_embs = caption_emb.repeat(bsz, 1, 1, 1).to(device)
         
         bsz = caption_embs.shape[0]
@@ -304,203 +297,6 @@ def generate(
                 make_grid(output, nrow=output.shape[0] // 3, padding=3, pad_value=1).permute(1, 2, 0).numpy() * 255
             ).astype(np.uint8)
             return output
-
-def generate_perturbed_image(
-    embeddings,
-    guidance_scale=4.5,
-    seed=10,
-    enable_grad=False
-):
-    """
-    Generate image from embeddings using DPMS_INTER and VAE decoder.
-    
-    Args:
-        embeddings: Tensor of embeddings (bsz, 1, 1, embed_dim) to use as condition
-        guidance_scale: Guidance scale for classifier-free guidance
-        seed: Random seed for noise generation
-        enable_grad: Whether to enable gradients for optimization (default: False)
-        
-    Returns:
-        output: Generated images tensor (B, C, H, W) in range [0, 1]
-    """
-    vae, model = models["vae"], models["diffusion"]
-    
-    # Set random seed
-    np.random.seed(seed)
-    torch.random.manual_seed(seed)
-    
-    # Ensure embeddings are on the correct device
-    embeddings = embeddings.to(device)
-    
-    bsz = embeddings.shape[0]
-    null_y = model.y_embedder.y_embedding[None].repeat(bsz, 1, 1)[:, None]
-    z = torch.randn(1, 4, 32, 32, device=device).repeat(bsz, 1, 1, 1)
-    model_kwargs = dict(mask=None)
-    
-    dpm_solver = DPMS_INTER(model.forward_with_dpmsolver,
-                        condition=embeddings,
-                        uncondition=null_y,
-                        cfg_scale=guidance_scale,
-                        model_kwargs=model_kwargs)
-    output = dpm_solver.sample(
-            z,
-            steps=20,  # Default steps for multistep method
-            order=2,
-            skip_type="time_uniform",
-            method="multistep",
-            enable_grad=enable_grad)
-    output = vae.decode(output / 0.18215).sample
-    output = torch.clamp(output * 0.5 + 0.5, min=0, max=1)
-    
-    return output
-
-def optimize_perturbed_image(
-    prompt_img1,
-    target_index=0,
-    bsz=1,
-    guidance_scale=4.5,
-    seed=10,
-    num_iterations=10,
-    learning_rate=0.01,
-    l2_reg_weight=0.01,
-    output_folder=None
-):
-    vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
-    
-    # Ensure all models are frozen
-    freeze_model_parameters(vae)
-    freeze_model_parameters(dino)
-    freeze_model_parameters(model)
-    
-    # Load CLIP model and processor
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    clip_model.eval()
-    freeze_model_parameters(clip_model)
-    
-    prompt_img1_tensor = transform(prompt_img1).unsqueeze(0)
-    
-    with torch.no_grad():
-        caption_emb = dino(prompt_img1_tensor.to(device))
-        caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
-    
-    variant_axes = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
-    
-    optimizer = torch.optim.Adam([variant_axes], lr=learning_rate)
-    
-    loss_history = []
-    iteration_images = []
-    
-    if output_folder is not None:
-        os.makedirs(output_folder, exist_ok=True)
-        iteration_folder = os.path.join(output_folder, "iterations")
-        os.makedirs(iteration_folder, exist_ok=True)
-    
-    print(f"\n{'='*60}")
-    print(f"Training variant_axes for {num_iterations} iterations")
-    print(f"Target prompt: {_CLIP_PROMPTS[target_index]}")
-    print(f"Learning rate: {learning_rate}, L2 reg weight: {l2_reg_weight}")
-    print(f"{'='*60}\n")
-    
-    for iteration in range(num_iterations):
-        optimizer.zero_grad()
-        
-        perturbed_emb = caption_emb + variant_axes
-        
-        generated_image = generate_perturbed_image(
-            embeddings=perturbed_emb,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            enable_grad=False
-        )
-        
-        total_loss, similarities = compute_clip_loss(
-            generated_image=generated_image,
-            variant_axes=variant_axes,
-            clip_model=clip_model,
-            processor=processor,
-            target_index=target_index,
-            l2_reg_weight=l2_reg_weight,
-            device=device
-        )
-        
-        total_loss.backward()
-        
-        optimizer.step()
-         
-        loss_history.append(total_loss.item())
-        
-        # Save image from this iteration
-        # Make a copy of the generated image to avoid detaching the original
-        with torch.no_grad():
-            iter_image_copy = generated_image[0].clone().cpu()
-            iter_image_np = (iter_image_copy.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            iter_image_pil = Image.fromarray(iter_image_np)
-            iteration_images.append(iter_image_pil)
-            
-            # Save to disk if output folder is provided
-            if output_folder is not None:
-                iter_image_path = os.path.join(iteration_folder, f"iteration_{iteration + 1:03d}.png")
-                iter_image_pil.save(iter_image_path)
-        
-        if (iteration + 1) % max(1, num_iterations // 5) == 0 or iteration == 0:
-            print(f"Iteration {iteration + 1}/{num_iterations}:")
-            print(f"  Total Loss: {total_loss.item():.4f}")
-            print(f"  Similarities: {similarities[0].cpu().detach().numpy()}")
-            print()
-    
-    with torch.no_grad():
-        perturbed_emb = caption_emb + variant_axes
-        generated_image = generate_perturbed_image(
-            embeddings=perturbed_emb,
-            guidance_scale=guidance_scale,
-            seed=seed
-        )
-    
-    return generated_image, variant_axes, loss_history, iteration_images
-
-def compute_clip_loss(
-    generated_image,
-    variant_axes,
-    clip_model,
-    processor,
-    target_index,
-    l2_reg_weight=0.01,
-    device=None
-):
-    clip_image = torch.nn.functional.interpolate(
-        generated_image, size=(224, 224), mode='bilinear', align_corners=False
-    )
-    
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
-    clip_image = (clip_image - mean) / std
-    
-    image_features = clip_model.get_image_features(pixel_values=clip_image)
-    
-    text_inputs = processor(text=_CLIP_PROMPTS, return_tensors="pt", padding=True)
-    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-    with torch.no_grad():
-        text_features = clip_model.get_text_features(
-            input_ids=text_inputs['input_ids'], 
-            attention_mask=text_inputs['attention_mask']
-        )
-    
-    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    
-    target_feat = text_features[target_index]
-    
-    clip_loss = -torch.matmul(image_features, target_feat)
-    clip_loss = clip_loss.mean()
-    
-    similarities = torch.matmul(image_features, text_features.t())  # (B, num_prompts)
-    
-    l2_reg = l2_reg_weight * torch.norm(variant_axes) ** 2
-    
-    total_loss = clip_loss + l2_reg
-    
-    return total_loss, similarities
 
 
 if __name__ == "__main__":
@@ -563,49 +359,16 @@ if __name__ == "__main__":
     aug_folder = os.path.join(output_root, "aug")
     os.makedirs(aug_folder, exist_ok=True)
 
-    if LEARN_EMB_PERTURBATION:
-        print(f"\n{'='*60}")
-        print("LEARN_EMB_PERTURBATION mode: Optimizing variant_axes")
-        print(f"{'='*60}")
-
-        target_index = 1  # Target prompt index (can be changed)
-        base_image_path = os.path.join(input_folder, "n02111889_7148.JPEG")
-        prompt_img1 = Image.open(base_image_path)
-
-        generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
-            prompt_img1=prompt_img1,
-            target_index=target_index,
-            bsz=1,
-            guidance_scale=4.5,
-            seed=10,
-            num_iterations=10,
-            learning_rate=0.01,
-            l2_reg_weight=0.01,
-            output_folder=output_root
-        )
-
-        generated_image_np = (generated_image[0].cpu().detach().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        output_image = Image.fromarray(generated_image_np)
-        output_path = os.path.join(aug_folder, "output_perturbed.png")
-
-        create_combined_image_with_labels(prompt_img1, output_image, output_path)
-
-        print(f"✓ Output saved to {output_path}")
-        print(f"✓ Saved {len(iteration_images)} iteration images to {os.path.join(output_root, 'iterations')}")
-        print(f"Final loss: {loss_history[-1]:.4f}")
-        print(f"{'='*60}\n")
-        prompt_img1.close()
+    prompt_img2 = None
+    if INTERPOLATION:
+        prompt_img2 = Image.open(image2_path)
+        bsz = 12
+        output_filename_base = "output_interpolation"
+    elif INTERPRETATION:
+        bsz = 1
+        output_filename_base = "output_interpretation"
     else:
-        prompt_img2 = None
-        if INTERPOLATION:
-            prompt_img2 = Image.open(image2_path)
-            bsz = 12
-            output_filename_base = "output_interpolation"
-        elif INTERPRETATION:
-            bsz = 1
-            output_filename_base = "output_interpretation"
-        else:
-            raise ValueError("Either INTERPOLATION, INTERPRETATION, or LEARN_EMB_PERTURBATION must be True")
+        raise ValueError("Either INTERPOLATION or INTERPRETATION must be True")
 
         guidance_scale = 4.5
         num_inference_steps = 20

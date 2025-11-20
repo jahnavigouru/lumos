@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 from transformers import CLIPModel, CLIPProcessor
 
+try:
+    import lpips as lpips_lib
+except ImportError:
+    lpips_lib = None
 
 class DirectionLoss(torch.nn.Module):
     def __init__(self, loss_type='mse'):
@@ -88,4 +92,18 @@ class CLIPLoss(torch.nn.Module):
         target_img = self.prepare_image_for_clip(target_img, device)
         clip_loss = self.lambda_direction * self.clip_directional_loss(src_img, source_class, target_img, target_class)
         return clip_loss
+
+class LPIPSLoss(torch.nn.Module):
+    def __init__(self, net_type: str = "vgg"):
+        super().__init__()
+        if lpips_lib is None:
+            raise ImportError("lpips package is required for LPIPSLoss (pip install lpips)")
+        self.metric = lpips_lib.LPIPS(net=net_type)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if x.min() >= 0 and x.max() <= 1:
+            x = x * 2 - 1
+        if y.min() >= 0 and y.max() <= 1:
+            y = y * 2 - 1
+        return self.metric(x, y).mean()
 
