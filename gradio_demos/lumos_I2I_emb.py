@@ -23,95 +23,10 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
 from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform
+from loss import DirectionLoss, CLIPLoss
 
-LEARN_EMB_PERTURBATION = True
 src_txt = "a white dog"
 trg_txt = "a black dog"
-
-class DirectionLoss(torch.nn.Module):
-    def __init__(self, loss_type='mse'):
-        super(DirectionLoss, self).__init__()
-        self.loss_type = loss_type
-        self.loss_func = {
-            'mse':    torch.nn.MSELoss,
-            'cosine': torch.nn.CosineSimilarity,
-            'mae':    torch.nn.L1Loss
-        }[loss_type]()
-
-    def forward(self, x, y):
-        if self.loss_type == "cosine":
-            return 1. - self.loss_func(x, y)
-        
-        return self.loss_func(x, y)
-
-class CLIPLoss(torch.nn.Module):
-    def __init__(self, clip_model, processor, loss_type='mse', lambda_direction=1.0):
-        super(CLIPLoss, self).__init__()
-        self.clip_model = clip_model
-        self.processor = processor
-        self.direction_loss = DirectionLoss(loss_type=loss_type)
-        self.target_direction = None
-        self.lambda_direction = lambda_direction
-
-    def encode_images(self, img: torch.Tensor) -> torch.Tensor:
-        """Encode images using CLIP model."""
-        return self.clip_model.get_image_features(pixel_values=img)
-
-    def get_text_features(self, text: str) -> torch.Tensor:
-        """Get text features from CLIP model."""
-        text_inputs = self.processor(text=[text], return_tensors="pt", padding=True)
-        text_inputs = {k: v.to(next(self.clip_model.parameters()).device) for k, v in text_inputs.items()}
-        with torch.no_grad():
-            text_features = self.clip_model.get_text_features(
-                input_ids=text_inputs['input_ids'], 
-                attention_mask=text_inputs['attention_mask']
-            )
-        return text_features
-
-    def prepare_image_for_clip(self, img: torch.Tensor, device=None) -> torch.Tensor:
-        """Prepare raw image for CLIP (resize to 224x224 and normalize)."""
-        if device is None:
-            device = next(self.clip_model.parameters()).device
-
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
-        img = img.to(device)
-        img = torch.nn.functional.interpolate(img, size=(224, 224), mode='bilinear', align_corners=False)
-        img = (img - mean) / std
-        
-        return img
-
-    def get_image_features(self, img: torch.Tensor, norm: bool = True) -> torch.Tensor:
-        image_features = self.encode_images(img)
-        
-        if norm:
-            image_features /= image_features.clone().norm(dim=-1, keepdim=True)
-        return image_features
-
-    def compute_text_direction(self, source_class: str, target_class: str) -> torch.Tensor:
-        source_features = self.get_text_features(source_class)
-        target_features = self.get_text_features(target_class)
-        text_direction = (target_features - source_features).mean(axis=0, keepdim=True)
-        text_direction /= text_direction.norm(dim=-1, keepdim=True)
-        return text_direction
-
-    def clip_directional_loss(self, src_img: torch.Tensor, source_class: str, target_img: torch.Tensor, target_class: str) -> torch.Tensor:
-        if self.target_direction is None:
-            self.target_direction = self.compute_text_direction(source_class, target_class)
-
-        src_encoding    = self.get_image_features(src_img)
-        target_encoding = self.get_image_features(target_img)
-        edit_direction = (target_encoding - src_encoding)
-        edit_direction /= (edit_direction.clone().norm(dim=-1, keepdim=True) + 1e-7)
-
-        return self.direction_loss(edit_direction, self.target_direction).mean()
-
-    def forward(self, src_img: torch.Tensor, source_class: str, target_img: torch.Tensor, target_class: str, device=None) -> torch.Tensor:
-        # Prepare images for CLIP if they're raw (not already normalized)
-        src_img = self.prepare_image_for_clip(src_img, device)
-        target_img = self.prepare_image_for_clip(target_img, device)
-        clip_loss = self.lambda_direction * self.clip_directional_loss(src_img, source_class, target_img, target_class)
-        return clip_loss
 
 def generate_perturbed_image(
     embeddings,
@@ -140,7 +55,7 @@ def generate_perturbed_image(
                         model_kwargs=model_kwargs)
     output = dpm_solver.sample(
             z,
-            steps=20,  # Default steps for multistep method
+            steps=20,
             order=2,
             skip_type="time_uniform",
             method="multistep",
@@ -149,6 +64,29 @@ def generate_perturbed_image(
     output = torch.clamp(output * 0.5 + 0.5, min=0, max=1)
     
     return output
+
+def compute_clip_loss(
+    original_image,
+    generated_image,
+    clip_model,
+    processor,
+    device=None,
+    lambda_direction=1.0
+):
+    x0 = original_image
+    x = generated_image
+
+    clip_loss_func = CLIPLoss(clip_model, processor, loss_type='cosine', lambda_direction=lambda_direction)
+    clip_loss_value = clip_loss_func(x0, src_txt, x, trg_txt, device=device)
+    
+    loss_clip = (2 - clip_loss_value) / 2
+    loss_clip = -torch.log(loss_clip)
+    
+    loss_l1 = nn.L1Loss()(x0, x)
+    
+    total_loss = 3 * loss_clip + 0.1 * loss_l1
+    
+    return total_loss
 
 def optimize_perturbed_image(
     prompt_img1,
@@ -177,7 +115,7 @@ def optimize_perturbed_image(
         caption_emb = dino(prompt_img1_tensor.to(device))
         caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
     
-    variant_axes = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
+    variant_axes = nn.Parameter(torch.randn_like(caption_emb) * 0.01).to(device)
     
     optimizer = torch.optim.Adam([variant_axes], lr=learning_rate)
     
@@ -258,29 +196,6 @@ def optimize_perturbed_image(
     
     return generated_image, variant_axes, loss_history, iteration_images
 
-def compute_clip_loss(
-    original_image,
-    generated_image,
-    clip_model,
-    processor,
-    device=None,
-    lambda_direction=1.0
-):
-    x0 = original_image
-    x = generated_image
-
-    clip_loss_func = CLIPLoss(clip_model, processor, loss_type='cosine', lambda_direction=lambda_direction)
-    clip_loss_value = clip_loss_func(x0, src_txt, x, trg_txt, device=device)
-    
-    loss_clip = (2 - clip_loss_value) / 2
-    loss_clip = -torch.log(loss_clip)
-    
-    loss_l1 = nn.L1Loss()(x0, x)
-    
-    total_loss = 3 * loss_clip + 0.1 * loss_l1
-    
-    return total_loss
-
 
 if __name__ == "__main__":
     parser = simple_parsing.ArgumentParser(description="Lumos Image Embedding Perturbation Demo")
@@ -341,32 +256,31 @@ if __name__ == "__main__":
     aug_folder = os.path.join(output_root, "aug")
     os.makedirs(aug_folder, exist_ok=True)
 
-    if LEARN_EMB_PERTURBATION:
-        print(f"\n{'='*60}")
-        print("LEARN_EMB_PERTURBATION mode: Optimizing variant_axes")
-        print(f"{'='*60}")
+    print(f"\n{'='*60}")
+    print("Optimizing variant_axes")
+    print(f"{'='*60}")
 
-        base_image_path = input_image_paths[0]
-        prompt_img1 = Image.open(base_image_path)
+    base_image_path = input_image_paths[0]
+    prompt_img1 = Image.open(base_image_path)
 
-        generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
-            prompt_img1=prompt_img1,
-            guidance_scale=4.5,
-            seed=10,
-            num_iterations=10,
-            learning_rate=0.01,
-            output_folder=output_root
-        )
+    generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
+        prompt_img1=prompt_img1,
+        guidance_scale=4.5,
+        seed=10,
+        num_iterations=10,
+        learning_rate=0.01,
+        output_folder=output_root
+    )
 
-        generated_image_np = (generated_image[0].cpu().detach().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        output_image = Image.fromarray(generated_image_np)
-        output_path = os.path.join(aug_folder, "output_perturbed.png")
+    generated_image_np = (generated_image[0].cpu().detach().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    output_image = Image.fromarray(generated_image_np)
+    output_path = os.path.join(aug_folder, "output_perturbed.png")
 
-        create_combined_image_with_labels(prompt_img1, output_image, output_path)
+    create_combined_image_with_labels(prompt_img1, output_image, output_path)
 
-        print(f"✓ Output saved to {output_path}")
-        print(f"✓ Saved {len(iteration_images)} iteration images to {os.path.join(output_root, 'iterations')}")
-        print(f"Final loss: {loss_history[-1]:.4f}")
-        print(f"{'='*60}\n")
-        prompt_img1.close()
+    print(f"✓ Output saved to {output_path}")
+    print(f"✓ Saved {len(iteration_images)} iteration images to {os.path.join(output_root, 'iterations')}")
+    print(f"Final loss: {loss_history[-1]:.4f}")
+    print(f"{'='*60}\n")
+    prompt_img1.close()
 
