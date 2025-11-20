@@ -24,10 +24,20 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+try:
+    import umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+    print("Warning: umap-learn not available. Install with: pip install umap-learn")
 
 INTERPOLATION = True
 INTERPRETATION = False
 LEARN_IMG_PERTURBATION = False
+PLOT_TRACJECTORY = True
+PLOT_VARIANCE = True
 
 MAX_SEED = 2147483647
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
@@ -225,6 +235,242 @@ def create_interpretation_grid(original_input, original_output, augmented_input=
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
+class PlotTrajectory(nn.Module):
+    def __init__(self, method='PCA', output_dir=None):
+        super(PlotTrajectory, self).__init__()
+        method_upper = method.upper()
+   
+        if method_upper in ['TSNE', 'T-SNE']:
+            self.method = 'TSNE'
+        elif method_upper == 'PCA':
+            self.method = 'PCA'
+        elif method_upper == 'UMAP':
+            self.method = 'UMAP'
+        else:
+            raise ValueError(f"Method must be 'PCA', 'TSNE' (or 'T-SNE'), or 'UMAP', got '{method}'")
+        
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(__file__), "plots")
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Check UMAP availability
+        self.umap_available = UMAP_AVAILABLE
+        if self.method == 'UMAP' and not self.umap_available:
+            raise ImportError("UMAP is not available. Install with: pip install umap-learn")
+    
+    def forward(self, embeddings):
+        # Reshape embeddings to [bsz, 768] if needed
+        if embeddings.dim() == 4:
+            embeddings = embeddings.squeeze(1).squeeze(1)  # [bsz, 768]
+        elif embeddings.dim() == 2:
+            pass  # Already [bsz, 768]
+        else:
+            raise ValueError(f"Unexpected embedding shape: {embeddings.shape}")
+        
+        # Convert to numpy
+        embeddings_np = embeddings.detach().cpu().numpy()
+        
+        # Plot based on method
+        if self.method == 'PCA':
+            return self._plot_pca(embeddings_np)
+        elif self.method == 'TSNE':
+            return self._plot_tsne(embeddings_np)
+        elif self.method == 'UMAP':
+            return self._plot_umap(embeddings_np)
+    
+    def _plot_pca(self, embeddings_np):
+        print("Computing PCA...")
+        pca = PCA(n_components=2)
+        embeddings_reduced = pca.fit_transform(embeddings_np)
+        
+        return self._create_plot(
+            embeddings_reduced,
+            f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)',
+            f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)',
+            'Embedding Trajectory - PCA',
+            'trajectory_pca.png'
+        )
+    
+    def _plot_tsne(self, embeddings_np):
+        print("Computing t-SNE (this may take a while)...")
+        n_samples = embeddings_np.shape[0]
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, n_samples-1), n_iter=1000)
+        embeddings_reduced = tsne.fit_transform(embeddings_np)
+        
+        return self._create_plot(
+            embeddings_reduced,
+            't-SNE Dimension 1',
+            't-SNE Dimension 2',
+            'Embedding Trajectory - t-SNE',
+            'trajectory_tsne.png'
+        )
+    
+    def _plot_umap(self, embeddings_np):
+        if not self.umap_available:
+            raise ImportError("UMAP is not available. Install with: pip install umap-learn")
+        
+        print("Computing UMAP...")
+        n_samples = embeddings_np.shape[0]
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, n_samples-1))
+        embeddings_reduced = reducer.fit_transform(embeddings_np)
+        
+        return self._create_plot(
+            embeddings_reduced,
+            'UMAP Dimension 1',
+            'UMAP Dimension 2',
+            'Embedding Trajectory - UMAP',
+            'trajectory_umap.png'
+        )
+    
+    def _create_plot(self, embeddings_reduced, xlabel, ylabel, title, filename):
+        n_samples = embeddings_reduced.shape[0]
+        colors = plt.cm.viridis(np.linspace(0, 1, n_samples))
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        scatter = ax.scatter(embeddings_reduced[:, 0], embeddings_reduced[:, 1], 
+                           c=colors, s=50, alpha=0.7, edgecolors='black', linewidths=0.5)
+        # Draw trajectory line
+        ax.plot(embeddings_reduced[:, 0], embeddings_reduced[:, 1], 'k-', alpha=0.3, linewidth=1)
+        # Mark start and end points
+        ax.scatter(embeddings_reduced[0, 0], embeddings_reduced[0, 1], c='red', s=200, marker='o', 
+                   edgecolors='black', linewidths=2, label='Start', zorder=5)
+        ax.scatter(embeddings_reduced[-1, 0], embeddings_reduced[-1, 1], c='blue', s=200, marker='s', 
+                   edgecolors='black', linewidths=2, label='End', zorder=5)
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        output_path = os.path.join(self.output_dir, filename)
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"✓ {self.method} plot saved to {output_path}")
+        return output_path
+
+class PlotVariance(nn.Module):
+    """
+    A PyTorch module for plotting variance explained by PCA components.
+    Creates scree plot and cumulative variance plot.
+    """
+    def __init__(self, output_dir=None, n_components=None):
+        """
+        Initialize PlotVariance module.
+        
+        Args:
+            output_dir: str - directory to save plots (default: plots folder)
+            n_components: int - number of components to plot (default: all or min(50, n_samples))
+        """
+        super(PlotVariance, self).__init__()
+        
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(__file__), "plots")
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.n_components = n_components
+    
+    def forward(self, embeddings):
+        """
+        Plot variance explained by PCA components.
+        
+        Args:
+            embeddings: torch.Tensor of shape [bsz, 1, 1, 768] or [bsz, 768] - embeddings
+        
+        Returns:
+            str - path to saved plot file
+        """
+        # Reshape embeddings to [bsz, 768] if needed
+        if embeddings.dim() == 4:
+            embeddings = embeddings.squeeze(1).squeeze(1)  # [bsz, 768]
+        elif embeddings.dim() == 2:
+            pass  # Already [bsz, 768]
+        else:
+            raise ValueError(f"Unexpected embedding shape: {embeddings.shape}")
+        
+        # Convert to numpy
+        embeddings_np = embeddings.detach().cpu().numpy()
+        n_samples, n_features = embeddings_np.shape
+        
+        # Determine number of components to use
+        max_components = min(n_samples, n_features)
+        if self.n_components is None:
+            n_components = min(50, max_components)  # Default to 50 or max available
+        else:
+            n_components = min(self.n_components, max_components)
+        
+        print(f"Computing PCA with {n_components} components for variance analysis...")
+        pca = PCA(n_components=n_components)
+        pca.fit(embeddings_np)
+        
+        # Get explained variance ratios
+        explained_variance_ratio = pca.explained_variance_ratio_
+        cumulative_variance = np.cumsum(explained_variance_ratio)
+        component_numbers = np.arange(1, len(explained_variance_ratio) + 1)
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Subplot 1: Scree plot (individual variance)
+        ax1.bar(component_numbers, explained_variance_ratio * 100, alpha=0.7, color='steelblue', edgecolor='black', linewidth=0.5)
+        ax1.plot(component_numbers, explained_variance_ratio * 100, 'ro-', markersize=4, linewidth=1.5, label='Individual Variance')
+        ax1.set_xlabel('Principal Component', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Explained Variance (%)', fontsize=12, fontweight='bold')
+        ax1.set_title('Scree Plot - Individual Variance Explained', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3, axis='y')
+        ax1.legend()
+        
+        # Subplot 2: Cumulative variance plot
+        ax2.plot(component_numbers, cumulative_variance * 100, 'bo-', markersize=5, linewidth=2, label='Cumulative Variance')
+        ax2.fill_between(component_numbers, 0, cumulative_variance * 100, alpha=0.3, color='steelblue')
+        ax2.axhline(y=90, color='r', linestyle='--', linewidth=1.5, label='90% Variance')
+        ax2.axhline(y=95, color='orange', linestyle='--', linewidth=1.5, label='95% Variance')
+        ax2.set_xlabel('Number of Components', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Cumulative Explained Variance (%)', fontsize=12, fontweight='bold')
+        ax2.set_title('Cumulative Variance Explained', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        ax2.set_ylim([0, 105])
+        
+        # Find and annotate components needed for 90% and 95% variance
+        idx_90 = np.where(cumulative_variance >= 0.90)[0]
+        idx_95 = np.where(cumulative_variance >= 0.95)[0]
+        if len(idx_90) > 0:
+            n_comp_90 = component_numbers[idx_90[0]]
+            ax2.axvline(x=n_comp_90, color='r', linestyle='--', alpha=0.5, linewidth=1)
+            ax2.annotate(f'{n_comp_90} components\nfor 90% variance', 
+                         xy=(n_comp_90, 90), xytext=(10, 20), 
+                         textcoords='offset points', fontsize=9,
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                         arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+        if len(idx_95) > 0:
+            n_comp_95 = component_numbers[idx_95[0]]
+            ax2.axvline(x=n_comp_95, color='orange', linestyle='--', alpha=0.5, linewidth=1)
+            ax2.annotate(f'{n_comp_95} components\nfor 95% variance', 
+                         xy=(n_comp_95, 95), xytext=(10, -30), 
+                         textcoords='offset points', fontsize=9,
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                         arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+        
+        plt.suptitle('PCA Variance Analysis', fontsize=16, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        
+        output_path = os.path.join(self.output_dir, 'variance_analysis.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ Variance analysis plot saved to {output_path}")
+        print(f"  - First component explains: {explained_variance_ratio[0]*100:.2f}%")
+        if len(cumulative_variance) > 1:
+            print(f"  - First 2 components explain: {cumulative_variance[1]*100:.2f}%")
+        n_comp_90 = component_numbers[idx_90[0]] if len(idx_90) > 0 else None
+        n_comp_95 = component_numbers[idx_95[0]] if len(idx_95) > 0 else None
+        print(f"  - Components needed for 90% variance: {n_comp_90 if n_comp_90 is not None else 'N/A'}")
+        print(f"  - Components needed for 95% variance: {n_comp_95 if n_comp_95 is not None else 'N/A'}")
+        
+        return output_path
+
 def generate(
     prompt_img1,
     prompt_img2=None,
@@ -262,6 +508,16 @@ def generate(
             weights = np.arange(0, 1, 1/bsz).tolist()
             caption_embs = [caption_emb2 * wei + caption_emb1 * (1-wei) for wei in weights]
             caption_embs = torch.stack(caption_embs).to(device)
+            if PLOT_TRACJECTORY:
+                plotterPCA = PlotTrajectory(method='PCA')
+                plotterPCA(caption_embs)
+                plotter_tSNE = PlotTrajectory(method='TSNE')
+                plotter_tSNE(caption_embs)
+                plotter_UMAP = PlotTrajectory(method='UMAP')
+                plotter_UMAP(caption_embs)
+            if PLOT_VARIANCE:
+                plotter_variance = PlotVariance()
+                plotter_variance(caption_embs)
         else:
             # Always use original image for main output
             prompt_imgs = prompt_img1
@@ -344,7 +600,7 @@ if __name__ == "__main__":
     models["diffusion"] = model
 
     input_folder = os.path.join(os.path.dirname(__file__), "input")
-    image2_path = os.path.join(input_folder, "n02099712_8719.JPEG")
+    image2_path = os.path.join(input_folder, "n02111889_7148_O.png")
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
     input_image_paths = sorted(
         os.path.join(input_folder, f)
@@ -362,7 +618,7 @@ if __name__ == "__main__":
     prompt_img2 = None
     if INTERPOLATION:
         prompt_img2 = Image.open(image2_path)
-        bsz = 12
+        bsz = 50
         output_filename_base = "output_interpolation"
     elif INTERPRETATION:
         bsz = 1
