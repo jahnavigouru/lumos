@@ -26,10 +26,9 @@ matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
 
 INTERPOLATION = False
-INTERPRETATION = False
-INFO_GRAD = False
+INTERPRETATION = True
 LEARN_IMG_PERTURBATION = False
-LEARN_EMB_PERTURBATION = True
+LEARN_EMB_PERTURBATION = False
 _CLIP_PROMPTS = [
     "a fluffy dog",
     "a black dog",
@@ -107,7 +106,6 @@ def add_gaussian_noise(img, mean=0.0, std=0.1):
     noise = torch.randn_like(img) * std + mean
     return torch.clamp(img + noise, 0.0, 1.0)
 
-
 def random_crop_original_minus(img, shrink=50):
     w, h = img.size
     crop_size = max(1, min(w, h) - shrink)
@@ -120,7 +118,6 @@ def random_crop_original_minus(img, shrink=50):
     left = random.randint(0, max_left) if max_left > 0 else 0
     top = random.randint(0, max_top) if max_top > 0 else 0
     return img.crop((left, top, left + crop_size, top + crop_size))
-
 
 def create_transform(learn_img_perturbation=False):
     if not learn_img_perturbation:
@@ -160,58 +157,8 @@ def tensor_to_display_image(tensor):
     return Image.fromarray(img)
 
 def freeze_model_parameters(model):
-    """
-    Freeze all parameters of a model by setting requires_grad=False.
-    
-    Args:
-        model: PyTorch model to freeze
-    """
     for param in model.parameters():
         param.requires_grad = False
-
-def print_frozen_modules(model, model_name):
-    """
-    Print which modules have requires_grad=False (frozen parameters).
-    
-    Args:
-        model: PyTorch model
-        model_name: Name of the model for printing
-    """
-    print(f"\n{'='*60}")
-    print(f"Checking frozen parameters for: {model_name}")
-    print(f"{'='*60}")
-    
-    frozen_modules = []
-    trainable_modules = []
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            frozen_modules.append(name)
-        else:
-            trainable_modules.append(name)
-    
-    if frozen_modules:
-        print(f"\nFrozen modules (requires_grad=False): {len(frozen_modules)}")
-        print("-" * 60)
-        for name in frozen_modules[:20]:  # Print first 20
-            print(f"  {name}")
-        if len(frozen_modules) > 20:
-            print(f"  ... and {len(frozen_modules) - 20} more")
-    else:
-        print("\nNo frozen modules found (all parameters have requires_grad=True)")
-    
-    if trainable_modules:
-        print(f"\nTrainable modules (requires_grad=True): {len(trainable_modules)}")
-        print("-" * 60)
-        for name in trainable_modules[:20]:  # Print first 20
-            print(f"  {name}")
-        if len(trainable_modules) > 20:
-            print(f"  ... and {len(trainable_modules) - 20} more")
-    else:
-        print("\nNo trainable modules found (all parameters have requires_grad=False)")
-    
-    total_params = len(frozen_modules) + len(trainable_modules)
-    print(f"\nSummary: {len(frozen_modules)}/{total_params} frozen, {len(trainable_modules)}/{total_params} trainable")
 
 def create_combined_image_with_labels(input_image, output_image, output_path):
     """
@@ -327,6 +274,8 @@ def generate(
             prompt_imgs = prompt_img1
             caption_emb = dino(prompt_imgs.to(device))
             caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
+            test = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
+            caption_emb = caption_emb + test
             caption_embs = caption_emb.repeat(bsz, 1, 1, 1).to(device)
         
         bsz = caption_embs.shape[0]
@@ -416,57 +365,32 @@ def optimize_perturbed_image(
     l2_reg_weight=0.01,
     output_folder=None
 ):
-    """
-    Train variant_axes for num_iterations using CLIP loss and generate perturbed image.
-    
-    Args:
-        prompt_img1: Input PIL image
-        target_index: Index of target prompt in _CLIP_PROMPTS to maximize similarity with
-        bsz: Batch size
-        guidance_scale: Guidance scale for generation
-        seed: Random seed
-        num_iterations: Number of training iterations
-        learning_rate: Learning rate for optimizer
-        l2_reg_weight: Weight for L2 regularization
-        output_folder: Optional folder path to save iteration images
-        
-    Returns:
-        generated_image: Final generated image tensor (B, C, H, W) in range [0, 1]
-        variant_axes: Optimized learnable parameter tensor (bsz, 1, 1, embed_dim)
-        loss_history: List of loss values during training
-        iteration_images: List of PIL Images from each iteration
-    """
     vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
     
     # Ensure all models are frozen
-    freeze_model_parameters(vae)  # Freeze VAE encoder and decoder
-    freeze_model_parameters(dino)  # Freeze DINO vision encoder
-    freeze_model_parameters(model)  # Freeze diffusion model
+    freeze_model_parameters(vae)
+    freeze_model_parameters(dino)
+    freeze_model_parameters(model)
     
     # Load CLIP model and processor
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     clip_model.eval()
-    freeze_model_parameters(clip_model)  # Freeze CLIP model
+    freeze_model_parameters(clip_model)
     
-    # Transform and get image embedding
     prompt_img1_tensor = transform(prompt_img1).unsqueeze(0)
     
     with torch.no_grad():
-        # Generate embeddings from input image
         caption_emb = dino(prompt_img1_tensor.to(device))
         caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
     
-    # Create learnable variant_axes parameter (will be moved to device in generate_perturbed_image)
     variant_axes = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
     
-    # Setup optimizer (only optimize variant_axes)
     optimizer = torch.optim.Adam([variant_axes], lr=learning_rate)
     
     loss_history = []
-    iteration_images = []  # Store images from each iteration
+    iteration_images = []
     
-    # Create output folder for iteration images if provided
     if output_folder is not None:
         os.makedirs(output_folder, exist_ok=True)
         iteration_folder = os.path.join(output_folder, "iterations")
@@ -478,23 +402,18 @@ def optimize_perturbed_image(
     print(f"Learning rate: {learning_rate}, L2 reg weight: {l2_reg_weight}")
     print(f"{'='*60}\n")
     
-    # Training loop
     for iteration in range(num_iterations):
         optimizer.zero_grad()
         
-        # Combine embeddings and variant_axes to create perturbed_emb (without normalization)
         perturbed_emb = caption_emb + variant_axes
         
-        # Generate image using perturbed embeddings
-        # Enable gradients for optimization
         generated_image = generate_perturbed_image(
             embeddings=perturbed_emb,
             guidance_scale=guidance_scale,
             seed=seed,
-            enable_grad=False  # Enable gradients to flow through diffusion process
+            enable_grad=False
         )
         
-        # Compute CLIP loss
         total_loss, similarities = compute_clip_loss(
             generated_image=generated_image,
             variant_axes=variant_axes,
@@ -505,28 +424,10 @@ def optimize_perturbed_image(
             device=device
         )
         
-        # Backward pass
         total_loss.backward()
         
-        # Check if gradients are flowing to variant_axes
-        # Note: Gradients flow through: loss → image → VAE → diffusion → perturbed_emb → variant_axes_normalized → variant_axes
-        # The normalization operation is differentiable, so gradients will flow through it
-        grad_norm = torch.norm(variant_axes.grad) if variant_axes.grad is not None else torch.tensor(0.0)
-        
-        # Diagnostic: Check if variant_axes has gradients
-        has_grad = variant_axes.grad is not None
-        if not has_grad:
-            print(f"WARNING: variant_axes has no gradients! Gradient flow may be broken.")
-        
-        # Store previous variant_axes before update (for tracking weight changes)
-        prev_variant_axes = variant_axes.data.clone()
-        
         optimizer.step()
-        
-        # Compute weight change after update
-        weight_change = torch.norm(variant_axes.data - prev_variant_axes)
-        weight_change_percent = (weight_change / (torch.norm(prev_variant_axes) + 1e-8)) * 100
-        
+         
         loss_history.append(total_loss.item())
         
         # Save image from this iteration
@@ -542,17 +443,12 @@ def optimize_perturbed_image(
                 iter_image_path = os.path.join(iteration_folder, f"iteration_{iteration + 1:03d}.png")
                 iter_image_pil.save(iter_image_path)
         
-        # Print progress
         if (iteration + 1) % max(1, num_iterations // 5) == 0 or iteration == 0:
             print(f"Iteration {iteration + 1}/{num_iterations}:")
             print(f"  Total Loss: {total_loss.item():.4f}")
             print(f"  Similarities: {similarities[0].cpu().detach().numpy()}")
-            print(f"  Gradient Norm: {grad_norm.item():.6f}")
-            print(f"  Weight Change (L2 norm): {weight_change.item():.6f}")
-            print(f"  Weight Change (%): {weight_change_percent.item():.4f}%")
             print()
     
-    # Generate final image with optimized variant_axes
     with torch.no_grad():
         perturbed_emb = caption_emb + variant_axes
         generated_image = generate_perturbed_image(
@@ -572,36 +468,16 @@ def compute_clip_loss(
     l2_reg_weight=0.01,
     device=None
 ):
-    """
-    Compute CLIP loss using cross-entropy: maximize similarity with target prompt, plus L2 regularization.
-    
-    Args:
-        generated_image: Generated image tensor (B, C, H, W) in range [0, 1]
-        variant_axes: Learnable parameter tensor for L2 regularization
-        clip_model: CLIP model
-        processor: CLIP processor
-        target_index: Index of target prompt in _CLIP_PROMPTS to maximize similarity with
-        l2_reg_weight: Weight for L2 regularization on variant_axes
-        device: torch device
-        
-    Returns:
-        loss: Total loss value (scalar tensor)
-        similarities: Tensor of similarities (B, num_prompts)
-    """
-    # Preprocess image for CLIP - resize to 224x224 and normalize
-    # Resize to 224x224
     clip_image = torch.nn.functional.interpolate(
         generated_image, size=(224, 224), mode='bilinear', align_corners=False
     )
-    # CLIP normalization
+    
     mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
     std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
     clip_image = (clip_image - mean) / std
     
-    # Get image features with gradients
     image_features = clip_model.get_image_features(pixel_values=clip_image)
     
-    # Get text features without gradients
     text_inputs = processor(text=_CLIP_PROMPTS, return_tensors="pt", padding=True)
     text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
     with torch.no_grad():
@@ -610,24 +486,18 @@ def compute_clip_loss(
             attention_mask=text_inputs['attention_mask']
         )
     
-    # Normalize features
     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     
-    # Get target text feature
     target_feat = text_features[target_index]
     
-    # Negative cosine similarity (we want to maximize similarity, so minimize negative similarity)
     clip_loss = -torch.matmul(image_features, target_feat)
     clip_loss = clip_loss.mean()
     
-    # Compute similarity matrix for return value (for diagnostics)
     similarities = torch.matmul(image_features, text_features.t())  # (B, num_prompts)
     
-    # L2 regularization on variant_axes
     l2_reg = l2_reg_weight * torch.norm(variant_axes) ** 2
     
-    # Total loss
     total_loss = clip_loss + l2_reg
     
     return total_loss, similarities
@@ -676,14 +546,7 @@ if __name__ == "__main__":
     model.eval()
     model.to(weight_dtype)
     models["diffusion"] = model
-    
-    if INFO_GRAD:
-        # Print frozen modules for all models
-        print_frozen_modules(vae, "VAE")
-        print_frozen_modules(dino, "DINO Vision Encoder")
-        print_frozen_modules(model, "LumosI2I Diffusion Model")
-    
-    # Build list of input images
+
     input_folder = os.path.join(os.path.dirname(__file__), "input")
     image2_path = os.path.join(input_folder, "n02099712_8719.JPEG")
     valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
@@ -706,7 +569,7 @@ if __name__ == "__main__":
         print(f"{'='*60}")
 
         target_index = 1  # Target prompt index (can be changed)
-        base_image_path = input_image_paths[0]
+        base_image_path = os.path.join(input_folder, "n02111889_7148.JPEG")
         prompt_img1 = Image.open(base_image_path)
 
         generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
@@ -718,7 +581,7 @@ if __name__ == "__main__":
             num_iterations=10,
             learning_rate=0.01,
             l2_reg_weight=0.01,
-            output_folder=output_root  # Pass output folder to save iteration images
+            output_folder=output_root
         )
 
         generated_image_np = (generated_image[0].cpu().detach().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
@@ -849,7 +712,7 @@ if __name__ == "__main__":
                 process_generation(prompt_img1, image_tag=image_tag, target_folder=aug_folder)
                 prompt_img1.close()
         else:
-            prompt_img1 = Image.open(input_image_paths[0])
+            prompt_img1 = Image.open(os.path.join(input_folder, "n02111889_7148.JPEG"))
             process_generation(prompt_img1, target_folder=aug_folder)
             prompt_img1.close()
 
