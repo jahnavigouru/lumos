@@ -10,7 +10,6 @@ import simple_parsing
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.utils import clip_grad_norm_
 from diffusers.models import AutoencoderKL
 from lumos_diffusion import DPMS_INTER
 from utils.download import find_model
@@ -23,7 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
-from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform, save_iteration_image
+from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform
 
 LEARN_EMB_PERTURBATION = True
 src_txt = "a white dog"
@@ -156,14 +155,8 @@ def optimize_perturbed_image(
     guidance_scale=4.5,
     seed=10,
     num_iterations=10,
-    learning_rate=0.003,
-    l2_reg_weight=0.01,
-    max_grad_norm=1.0,
-    max_variant_norm=0.10,
-    lambda_clip=3.0,
-    lambda_l1=0.30,
-    output_folder=None,
-    enable_grad=False
+    learning_rate=0.01,
+    output_folder=None
 ):
     vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
     
@@ -191,7 +184,6 @@ def optimize_perturbed_image(
     loss_history = []
     iteration_images = []
     
-    iteration_folder = None
     if output_folder is not None:
         os.makedirs(output_folder, exist_ok=True)
         iteration_folder = os.path.join(output_folder, "iterations")
@@ -201,8 +193,7 @@ def optimize_perturbed_image(
     print(f"Training variant_axes for {num_iterations} iterations")
     print(f"Source text: {src_txt}")
     print(f"Target text: {trg_txt}")
-    print(f"Learning rate: {learning_rate}, L2 reg: {l2_reg_weight}")
-    print(f"Enable gradients: {enable_grad}")
+    print(f"Learning rate: {learning_rate}")
     print(f"{'='*60}\n")
     
     # Generate original image from original embedding for comparison
@@ -213,27 +204,18 @@ def optimize_perturbed_image(
             seed=seed,
             enable_grad=False
         )
-        
-        # Save original image to iteration folder as iteration_000.png
-        if output_folder is not None:
-            save_iteration_image(
-                image_tensor=original_image,
-                iteration_folder=iteration_folder,
-                filename="iteration_000.png",
-                print_message=f"Saved original image to {os.path.join(iteration_folder, 'iteration_000.png')}"
-            )
     
     for iteration in range(num_iterations):
-        if enable_grad:
-            optimizer.zero_grad()
+        optimizer.zero_grad()
         
         perturbed_emb = caption_emb + variant_axes
+        perturbed_emb = torch.nn.functional.normalize(perturbed_emb, dim=-1)
         
         generated_image = generate_perturbed_image(
             embeddings=perturbed_emb,
             guidance_scale=guidance_scale,
             seed=seed,
-            enable_grad=enable_grad
+            enable_grad=False
         )
         
         total_loss = compute_clip_loss(
@@ -241,23 +223,16 @@ def optimize_perturbed_image(
             generated_image=generated_image,
             clip_model=clip_model,
             processor=processor,
-            variant_axes=variant_axes,
-            l2_reg_weight=l2_reg_weight,
-            lambda_clip=lambda_clip,
-            lambda_l1=lambda_l1,
             device=device
         )
         
-        if enable_grad:
-            total_loss.backward()
-            optimizer.step()
-        else:
-            pass
+        total_loss.backward()
+        
+        optimizer.step()
          
         loss_history.append(total_loss.item())
         
         with torch.no_grad():
-            # Convert tensor to PIL Image and save if needed
             iter_image_copy = generated_image[0].clone().cpu()
             iter_image_np = (iter_image_copy.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             iter_image_pil = Image.fromarray(iter_image_np)
@@ -265,12 +240,8 @@ def optimize_perturbed_image(
             
             # Save to disk if output folder is provided
             if output_folder is not None:
-                save_iteration_image(
-                    image_tensor=generated_image,
-                    iteration_folder=iteration_folder,
-                    filename=f"iteration_{iteration + 1:03d}.png",
-                    print_message=None
-                )
+                iter_image_path = os.path.join(iteration_folder, f"iteration_{iteration + 1:03d}.png")
+                iter_image_pil.save(iter_image_path)
         
         if (iteration + 1) % max(1, num_iterations // 5) == 0 or iteration == 0:
             print(f"Iteration {iteration + 1}/{num_iterations}:")
@@ -292,12 +263,8 @@ def compute_clip_loss(
     generated_image,
     clip_model,
     processor,
-    variant_axes=None,
     device=None,
-    lambda_direction=1.0,
-    l2_reg_weight=0.01,
-    lambda_clip=3.0,
-    lambda_l1=0.30
+    lambda_direction=1.0
 ):
     x0 = original_image
     x = generated_image
@@ -310,12 +277,7 @@ def compute_clip_loss(
     
     loss_l1 = nn.L1Loss()(x0, x)
     
-    total_loss = lambda_clip * loss_clip + lambda_l1 * loss_l1
-    
-    # Keep the perturbation small so the embedding stays near the source content.
-    if variant_axes is not None and l2_reg_weight > 0:
-        l2_reg_loss = l2_reg_weight * torch.norm(variant_axes) ** 2
-        total_loss = total_loss + l2_reg_loss
+    total_loss = 3 * loss_clip + 0.1 * loss_l1
     
     return total_loss
 
@@ -384,22 +346,16 @@ if __name__ == "__main__":
         print("LEARN_EMB_PERTURBATION mode: Optimizing variant_axes")
         print(f"{'='*60}")
 
-        base_image_path = os.path.join(input_folder, "n02111889_7148.JPEG")
+        base_image_path = input_image_paths[0]
         prompt_img1 = Image.open(base_image_path)
 
         generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
             prompt_img1=prompt_img1,
             guidance_scale=4.5,
             seed=10,
-            num_iterations=120,
-            learning_rate=0.003,
-            lambda_clip=2.0,
-            lambda_l1=0.2,        # loosen pull to origin so edit can move
-            l2_reg_weight=0.01,    # softer L2 to allow movement
-            max_grad_norm=1.0,     # allow larger steps but still clipped
-            max_variant_norm=0.20, # allow bigger delta before projecting
-            output_folder=output_root,
-            enable_grad=True
+            num_iterations=10,
+            learning_rate=0.01,
+            output_folder=output_root
         )
 
         generated_image_np = (generated_image[0].cpu().detach().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
@@ -413,3 +369,4 @@ if __name__ == "__main__":
         print(f"Final loss: {loss_history[-1]:.4f}")
         print(f"{'='*60}\n")
         prompt_img1.close()
+
