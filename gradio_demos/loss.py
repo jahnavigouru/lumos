@@ -107,3 +107,4 @@ class LPIPSLoss(torch.nn.Module):
             y = y * 2 - 1
         return self.metric(x, y).mean()
 
+
