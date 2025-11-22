@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 from transformers import CLIPModel, CLIPProcessor
-from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform
-from loss import DirectionLoss, CLIPLoss, LPIPSLoss
+from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform, get_sam_loss
+from loss import DirectionLoss, CLIPLoss
 
 src_txt = "a white dog"
 trg_txt = "a black dog"
@@ -73,14 +73,16 @@ def compute_clip_loss(
     device=None,
     lambda_direction=1.0,
     variant_axes=None,
-    l2_reg_weight=0.02
+    l2_reg_weight=0.01,
+    lambda_clip=2.0,
+    lambda_l1=0.2,
+    sam_checkpoint=None,
+    sam_model_type="vit_h",
+    sam_background_dir=None,
+    sam_save_every: int = 1,
 ):
     x0 = original_image
     x = generated_image
-
-    loss_clip_w = 5
-    loss_l1_w = 0.3
-    loss_id_w = 0.5
 
     clip_loss_func = CLIPLoss(clip_model, processor, loss_type='cosine', lambda_direction=lambda_direction)
     clip_loss_value = clip_loss_func(x0, src_txt, x, trg_txt, device=device)
@@ -88,14 +90,30 @@ def compute_clip_loss(
     loss_clip = (2 - clip_loss_value) / 2
     loss_clip = -torch.log(loss_clip)
     
-    loss_l1 = nn.L1Loss()(x0, x)
+    loss_l1 = None
+    sam_loss = get_sam_loss(
+        sam_checkpoint=sam_checkpoint,
+        sam_model_type=sam_model_type,
+        device=device,
+        background_dir=sam_background_dir,
+        checkpoints_root=os.path.dirname(project_root),
+        save_every=sam_save_every,
+    )
+    if sam_loss is not None:
+        try:
+            loss_l1 = sam_loss(x0, x)
+            print(f"SAM Loss value: {loss_l1.item():.6f}")
+        except Exception as exc:
+            print(f"[warn] SAMLoss failed, using L1Loss instead: {exc}")
+            l1_loss_fn = nn.L1Loss()
+            loss_l1 = l1_loss_fn(x0, x)
+    else:
+        l1_loss_fn = nn.L1Loss()
+        loss_l1 = l1_loss_fn(x0, x)
 
-    # Identity preservation using LPIPS
-    lpips_device = device if device is not None else x0.device
-    lpips_metric = LPIPSLoss().to(lpips_device)
-    loss_id = lpips_metric(x0.to(lpips_device), x.to(lpips_device))
-    
-    total_loss = loss_clip_w * loss_clip + loss_l1_w * loss_l1 + loss_id_w * loss_id
+    total_loss = lambda_clip * loss_clip
+    if loss_l1 is not None:
+        total_loss = total_loss + lambda_l1 * loss_l1
     
     if variant_axes is not None and l2_reg_weight > 0:
         l2_reg_loss = l2_reg_weight * torch.norm(variant_axes) ** 2
@@ -108,9 +126,13 @@ def optimize_perturbed_image(
     guidance_scale=4.5,
     seed=10,
     num_iterations=10,
-    learning_rate=0.005,
-    max_variant_norm=0.1,
-    output_folder=None
+    learning_rate=2e-4,
+    lambda_clip=2.0,
+    lambda_l1=0.1,
+    l2_reg_weight=0.01,
+    max_grad_norm=1.0,
+    max_variant_norm=0.20,
+    output_folder=None,
 ):
     vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
     
@@ -122,13 +144,16 @@ def optimize_perturbed_image(
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     clip_model.eval()
     freeze_model_parameters(clip_model)
-    
+
     prompt_img1_tensor = transform(prompt_img1).unsqueeze(0)
     
     with torch.no_grad():
         caption_emb = dino(prompt_img1_tensor.to(device))
         caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
     
+    # Set random seed for deterministic variant_axes initialization
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     variant_axes = nn.Parameter(torch.randn_like(caption_emb) * 0.01).to(device)
     
     optimizer = torch.optim.Adam([variant_axes], lr=learning_rate)
@@ -145,7 +170,8 @@ def optimize_perturbed_image(
     print(f"Training variant_axes for {num_iterations} iterations")
     print(f"Source text: {src_txt}")
     print(f"Target text: {trg_txt}")
-    print(f"Learning rate: {learning_rate}, max variant norm: {max_variant_norm}")
+    print(f"Learning rate: {learning_rate}, lambda_clip: {lambda_clip}, lambda_l1: {lambda_l1}")
+    print(f"l2_reg_weight: {l2_reg_weight}, max_grad_norm: {max_grad_norm}, max variant norm: {max_variant_norm}")
     print(f"{'='*60}\n")
     
     # Generate original image from original embedding for comparison
@@ -182,38 +208,49 @@ def optimize_perturbed_image(
             clip_model=clip_model,
             processor=processor,
             device=device,
-            variant_axes=variant_axes
+            variant_axes=variant_axes,
+            l2_reg_weight=l2_reg_weight,
+            lambda_clip=lambda_clip,
+            lambda_l1=lambda_l1,
+            sam_checkpoint=os.path.join(os.path.dirname(project_root), "checkpoints", "sam_vit_h_4b8939.pth"),
+            sam_model_type="vit_h",
+            sam_background_dir=os.path.join(output_folder, "sam_backgrounds") if output_folder else None,
+            sam_save_every=10 if num_iterations > 100 else 1,
         )
         
         total_loss.backward()
+        if max_grad_norm is not None:
+            nn.utils.clip_grad_norm_([variant_axes], max_grad_norm)
         
         optimizer.step()
-        if max_variant_norm is not None:
-            with torch.no_grad():
-                current_norm = variant_axes.norm()
-                if current_norm > max_variant_norm:
-                    variant_axes.mul_(max_variant_norm / (current_norm + 1e-6))
+        # if max_variant_norm is not None:
+        #     with torch.no_grad():
+        #         current_norm = variant_axes.norm()
+        #         if current_norm > max_variant_norm:
+        #             variant_axes.mul_(max_variant_norm / (current_norm + 1e-6))
          
         loss_history.append(total_loss.item())
+        print(f"Iteration {iteration + 1}/{num_iterations}: Total Loss = {total_loss.item():.6f}")
         
+        # Only persist every 10th image if training is long-running (>100 iters) to save space
+        should_record_iteration = output_folder is None or num_iterations <= 100 or (iteration + 1) % 10 == 0
+        should_save_iteration = output_folder is not None and should_record_iteration
         with torch.no_grad():
             iter_image_copy = generated_image[0].clone().cpu()
             iter_image_np = (iter_image_copy.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             iter_image_pil = Image.fromarray(iter_image_np)
-            iteration_images.append(iter_image_pil)
-            
-            # Save to disk if output folder is provided
-            if output_folder is not None:
+            if should_record_iteration:
+                iteration_images.append(iter_image_pil)
+            if should_save_iteration:
                 iter_image_path = os.path.join(iteration_folder, f"iteration_{iteration + 1:03d}.png")
                 iter_image_pil.save(iter_image_path)
-        
-        if (iteration + 1) % max(1, num_iterations // 5) == 0 or iteration == 0:
-            print(f"Iteration {iteration + 1}/{num_iterations}:")
-            print(f"  Total Loss: {total_loss.item():.4f}")
-            print()
     
     with torch.no_grad():
         perturbed_emb = caption_emb + variant_axes
+        print(f"Perturbed embedding statistics:")
+        print(f"  Max value: {perturbed_emb.max().item():.6f}")
+        print(f"  Min value: {perturbed_emb.min().item():.6f}")
+        print(f"  Norm: {torch.norm(perturbed_emb).item():.6f}")
         generated_image = generate_perturbed_image(
             embeddings=perturbed_emb,
             guidance_scale=guidance_scale,
@@ -286,16 +323,20 @@ if __name__ == "__main__":
     print("Optimizing variant_axes")
     print(f"{'='*60}")
 
-    base_image_path = os.path.join(input_folder, "n02111889_7148.JPEG")
+    base_image_path = os.path.join(input_folder, "n02111889_7148_n.png")
     prompt_img1 = Image.open(base_image_path)
 
     generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
         prompt_img1=prompt_img1,
         guidance_scale=4.5,
         seed=10,
-        num_iterations=60,
-        learning_rate=0.005,
-        max_variant_norm=0.1,
+        num_iterations=400,
+        learning_rate=2e-4,
+        lambda_clip=3.0,
+        lambda_l1=0.2,
+        l2_reg_weight=0.01,
+        max_grad_norm=1.0,
+        max_variant_norm=0.20,
         output_folder=output_root
     )
 

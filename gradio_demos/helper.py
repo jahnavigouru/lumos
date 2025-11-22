@@ -6,12 +6,67 @@ import torchvision.transforms as T
 from PIL import Image
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from loss import SAMLoss
 try:
     import umap
     UMAP_AVAILABLE = True
 except ImportError:
     UMAP_AVAILABLE = False
 
+_SAM_CKPT_FILENAMES = {
+    "vit_h": "sam_vit_h_4b8939.pth",
+    "vit_l": "sam_vit_l_0b3195.pth",
+    "vit_b": "sam_vit_b_01ec64.pth",
+}
+_SAM_LOSS_CACHE = {}
+
+
+def get_sam_loss(
+    sam_checkpoint=None,
+    sam_model_type="vit_h",
+    device=None,
+    background_dir=None,
+    checkpoints_root=None,
+    save_every: int = 1,
+):
+    """
+    Lazily initialize and cache SAMLoss.
+    - sam_checkpoint: explicit checkpoint path; if None, use checkpoints_root + filename.
+    - sam_model_type: one of vit_h/vit_l/vit_b.
+    - device: torch device string; defaults to CUDA if available.
+    - background_dir: optional dir to save background-only images from SAMLoss.
+    - checkpoints_root: base dir containing checkpoints/; defaults to repo root.
+    """
+    base_root = (
+        checkpoints_root
+        if checkpoints_root is not None
+        else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    )
+
+    if sam_checkpoint is None:
+        filename = _SAM_CKPT_FILENAMES.get(sam_model_type, _SAM_CKPT_FILENAMES["vit_h"])
+        sam_checkpoint = os.path.join(base_root, "checkpoints", filename)
+
+    key = (sam_model_type, sam_checkpoint)
+    if key in _SAM_LOSS_CACHE:
+        return _SAM_LOSS_CACHE[key]
+
+    if not os.path.exists(sam_checkpoint):
+        print(f"[warn] SAM checkpoint not found at {sam_checkpoint}; skipping SAM loss.")
+        return None
+    try:
+        sam_loss = SAMLoss(
+            model_type=sam_model_type,
+            checkpoint=sam_checkpoint,
+            device=device,
+            save_background_dir=background_dir,
+            save_every=save_every,
+        )
+        _SAM_LOSS_CACHE[key] = sam_loss
+        return sam_loss
+    except Exception as exc:
+        print(f"[warn] Failed to initialize SAMLoss ({exc}); skipping SAM loss.")
+        return None
 
 def create_transform(learn_img_perturbation=False):
     if not learn_img_perturbation:
@@ -214,4 +269,3 @@ def plot_all_trajectories(trajectory_map, output_dir=None, methods=['PCA', 'TSNE
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"✓ {method} combined plot saved to {output_path}")
-

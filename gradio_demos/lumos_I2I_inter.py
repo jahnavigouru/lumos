@@ -34,9 +34,10 @@ except ImportError:
     UMAP_AVAILABLE = False
     print("Warning: umap-learn not available. Install with: pip install umap-learn")
 
-INTERPOLATION = True
-INTERPRETATION = False
+INTERPOLATION = False
+INTERPRETATION = True
 LEARN_IMG_PERTURBATION = False
+LEARN_EMB_PERTURBATION = True
 PLOT_TRACJECTORY = False
 PLOT_VARIANCE = False
 
@@ -236,6 +237,31 @@ def create_interpretation_grid(original_input, original_output, augmented_input=
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
+def gaussian_perturbation(caption_emb, std=0.01, target_norm=None):
+    """
+    Create a Gaussian noise tensor with the exact same shape as caption_emb.
+    Args:
+        caption_emb: torch.Tensor
+        std: float, standard deviation of the noise
+        target_norm: float or None; if provided, scale noise to have this L2 norm.
+    """
+    noise = torch.randn_like(caption_emb) * std
+    if target_norm is not None:
+        norm = noise.norm()
+        if norm > 0:
+            noise = noise * (target_norm / norm)
+    return caption_emb + noise
+
+def masking_perturbation(caption_emb, dropout_rate):
+    std = 0.01
+    gNoise = torch.randn_like(caption_emb) * std
+
+    # random mask per sample: shape [B, D]
+    mask = (torch.rand_like(caption_emb) > dropout_rate).float()
+
+    masked = caption_emb * mask
+    return masked + gNoise
+
 def generate(
     prompt_img1,
     prompt_img2=None,
@@ -246,7 +272,9 @@ def generate(
     randomize_seed=True,
     method="multistep",
     INTERPRETATION=True,
-    img_per=False
+    img_per=False,
+    mask_per=False,
+    g_per=False
 ):
     seed = int(randomize_seed_fn(seed, randomize_seed))
     np.random.seed(seed)
@@ -278,9 +306,24 @@ def generate(
             prompt_imgs = prompt_img1
             caption_emb = dino(prompt_imgs.to(device))
             caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
-            # test = nn.Parameter(torch.randn_like(caption_emb) * 0.01)
-            # caption_emb = caption_emb + test
-            caption_embs = caption_emb.repeat(bsz, 1, 1, 1).to(device)
+            emb_list = []
+            if mask_per:
+                drop_rates = [0.2, 0.4, 0.8, 1.0, 1.2]
+                perturbed_mask = torch.stack(
+                    [masking_perturbation(caption_emb, dropout_rate=dr) for dr in drop_rates],
+                    dim=0,
+                )
+                emb_list.append(torch.nn.functional.normalize(perturbed_mask, dim=-1))
+            if g_per:
+                norms = [1.0, 2.0, 3.0, 4.0, 5.0]
+                perturbed_gauss = torch.stack(
+                    [gaussian_perturbation(caption_emb, std=0.01, target_norm=n) for n in norms],
+                    dim=0,
+                )
+                emb_list.append(torch.nn.functional.normalize(perturbed_gauss, dim=-1))
+            if not emb_list:
+                emb_list.append(caption_emb)
+            caption_embs = torch.cat(emb_list, dim=0).to(device)
         
         bsz = caption_embs.shape[0]
         null_y = model.y_embedder.y_embedding[None].repeat(bsz, 1, 1)[:, None]
@@ -481,7 +524,7 @@ if __name__ == "__main__":
                 print(f"{'='*60}")
 
                 try:
-                    if INTERPRETATION and LEARN_IMG_PERTURBATION:
+                    if LEARN_IMG_PERTURBATION:
                         original_input, original_output = generate(
                             prompt_img1=prompt_img1,
                             prompt_img2=None,

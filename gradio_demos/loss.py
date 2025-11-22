@@ -1,11 +1,15 @@
+import os
 import torch
 import torch.nn as nn
+from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
 try:
-    import lpips as lpips_lib
-except ImportError:
-    lpips_lib = None
+    from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+    _SAM_AVAILABLE = True
+except Exception:
+    # Keep optional dependency truly optional; raise with a clear error when used.
+    _SAM_AVAILABLE = False
 
 class DirectionLoss(torch.nn.Module):
     def __init__(self, loss_type='mse'):
@@ -93,18 +97,101 @@ class CLIPLoss(torch.nn.Module):
         clip_loss = self.lambda_direction * self.clip_directional_loss(src_img, source_class, target_img, target_class)
         return clip_loss
 
-class LPIPSLoss(torch.nn.Module):
-    def __init__(self, net_type: str = "vgg"):
+
+class SAMLoss(torch.nn.Module):
+    """
+    Compute L1 loss only over background pixels, where background is defined as the
+    inverse of the largest SAM mask (foreground) for each image.
+    """
+
+    def __init__(
+        self,
+        sam_model=None,
+        model_type: str = "vit_h",
+        checkpoint: str = None,
+        device: str = None,
+        save_background_dir: str = None,
+        save_every: int = 1,
+    ):
         super().__init__()
-        if lpips_lib is None:
-            raise ImportError("lpips package is required for LPIPSLoss (pip install lpips)")
-        self.metric = lpips_lib.LPIPS(net=net_type)
+        if not _SAM_AVAILABLE:
+            raise ImportError("segment_anything is required for SAMLoss (pip install segment-anything)")
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        if x.min() >= 0 and x.max() <= 1:
-            x = x * 2 - 1
-        if y.min() >= 0 and y.max() <= 1:
-            y = y * 2 - 1
-        return self.metric(x, y).mean()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if sam_model is None:
+            if checkpoint is None:
+                raise ValueError("Provide either an initialized sam_model or a checkpoint path to load SAM.")
+            sam_model = sam_model_registry[model_type](checkpoint=checkpoint)
 
+        self.sam = sam_model.to(self.device)
+        self.sam.eval()
+        self.mask_generator = SamAutomaticMaskGenerator(self.sam)
+        self.l1 = nn.L1Loss(reduction="mean")
+        self.save_background_dir = save_background_dir
+        self._save_idx = 0
+        self.save_every = max(1, int(save_every))
 
+    def _largest_mask(self, img: torch.Tensor):
+        """
+        Generate the largest SAM mask for a single image tensor shaped (C, H, W).
+        Returns a numpy boolean array of shape (H, W) or None if no masks are found.
+        """
+        img_np = img.detach().permute(1, 2, 0).cpu().numpy()
+        masks = self.mask_generator.generate(img_np)
+        if len(masks) == 0:
+            return None
+        largest = max(masks, key=lambda m: m.get("area", 0))
+        return largest["segmentation"].astype(bool)
+
+    def _save_background_image(self, img: torch.Tensor, background_mask, label: str):
+        """Save a background-only image for inspection if a directory was provided."""
+        if self.save_background_dir is None:
+            return
+        os.makedirs(self.save_background_dir, exist_ok=True)
+        # img expected on any device, shape (C,H,W), values assumed in [0,1] or [0,255]
+        img_np = img.detach().cpu()
+        if img_np.max() <= 1.5:
+            img_np = (img_np * 255.0).clamp(0, 255)
+        img_np = img_np.byte().permute(1, 2, 0).numpy()
+        bg_mask = background_mask.astype(bool)
+        bg_img = img_np.copy()
+        bg_img[~bg_mask] = 0
+        fname = f"{label}_background_{self._save_idx:04d}.png"
+        Image.fromarray(bg_img).save(os.path.join(self.save_background_dir, fname))
+
+    def _background_l1(self, img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
+        mask_a = self._largest_mask(img_a)
+        mask_b = self._largest_mask(img_b)
+
+        # Fallback to full L1 if either mask is missing
+        if mask_a is None or mask_b is None:
+            print("[warn] SAMLoss: missing mask (mask_a or mask_b is None); falling back to full L1.")
+            return self.l1(img_a, img_b)
+
+        background = ~(mask_a | mask_b)
+        if not background.any():
+            print("[warn] SAMLoss: background empty after combining masks; falling back to full L1.")
+            return self.l1(img_a, img_b)
+
+        background_mask = torch.from_numpy(background).to(img_a.device, dtype=img_a.dtype)
+        background_mask = background_mask.unsqueeze(0)  # broadcast over channels
+
+        # Optionally save background-only visualizations for inspection
+        if self._save_idx % self.save_every == 0:
+            self._save_background_image(img_a, background, "img_a")
+            self._save_background_image(img_b, background, "img_b")
+        self._save_idx += 1
+
+        return self.l1(img_a * background_mask, img_b * background_mask)
+
+    def forward(self, img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
+        """
+        img_a, img_b: tensors shaped (C, H, W) or (B, C, H, W)
+        """
+        if img_a.dim() == 4:
+            if img_a.shape[0] != img_b.shape[0]:
+                raise ValueError("Batch size mismatch between img_a and img_b.")
+            losses = [self._background_l1(a, b) for a, b in zip(img_a, img_b)]
+            return torch.stack(losses).mean()
+
+        return self._background_l1(img_a, img_b)
