@@ -130,18 +130,24 @@ class SAMLoss(torch.nn.Module):
         self.save_background_dir = save_background_dir
         self._save_idx = 0
         self.save_every = max(1, int(save_every))
+        # Cache for original image mask (img_a is always the original image)
+        self._cached_original_mask = None
+        self._cached_original_num_masks = None
 
-    def _largest_mask(self, img: torch.Tensor):
+    def _largest_mask(self, img: torch.Tensor, return_count=False):
         """
         Generate the largest SAM mask for a single image tensor shaped (C, H, W).
         Returns a numpy boolean array of shape (H, W) or None if no masks are found.
+        If return_count=True, returns (mask, num_masks) tuple.
         """
         img_np = img.detach().permute(1, 2, 0).cpu().numpy()
         masks = self.mask_generator.generate(img_np)
-        if len(masks) == 0:
-            return None
+        num_masks = len(masks)
+        if num_masks == 0:
+            return (None, 0) if return_count else None
         largest = max(masks, key=lambda m: m.get("area", 0))
-        return largest["segmentation"].astype(bool)
+        mask = largest["segmentation"].astype(bool)
+        return (mask, num_masks) if return_count else mask
 
     def _save_background_image(self, img: torch.Tensor, background_mask, label: str):
         """Save a background-only image for inspection if a directory was provided."""
@@ -160,8 +166,20 @@ class SAMLoss(torch.nn.Module):
         Image.fromarray(bg_img).save(os.path.join(self.save_background_dir, fname))
 
     def _background_l1(self, img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
-        mask_a = self._largest_mask(img_a)
-        mask_b = self._largest_mask(img_b)
+        # Use cached mask for original image (img_a) if available, otherwise compute and cache it
+        if self._cached_original_mask is None:
+            mask_a, num_masks_a = self._largest_mask(img_a, return_count=True)
+            self._cached_original_mask = mask_a
+            self._cached_original_num_masks = num_masks_a
+            print(f"SAMLoss: Computing original image mask (img_a) - found {num_masks_a} masks (cached for future iterations)")
+        else:
+            mask_a = self._cached_original_mask
+            num_masks_a = self._cached_original_num_masks
+            print(f"SAMLoss: Using cached original image mask (img_a) - {num_masks_a} masks")
+        
+        # Always recompute mask for generated image (img_b) since it changes each iteration
+        mask_b, num_masks_b = self._largest_mask(img_b, return_count=True)
+        print(f"SAMLoss: img_b (generated) has {num_masks_b} masks")
 
         # Fallback to full L1 if either mask is missing
         if mask_a is None or mask_b is None:

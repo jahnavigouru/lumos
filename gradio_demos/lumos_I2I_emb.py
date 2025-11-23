@@ -25,8 +25,8 @@ from transformers import CLIPModel, CLIPProcessor
 from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform, get_sam_loss
 from loss import DirectionLoss, CLIPLoss
 
-src_txt = "a white dog"
-trg_txt = "a black dog"
+src_txt = "brown dog"
+trg_txt = "white dog"
 
 def generate_perturbed_image(
     embeddings,
@@ -75,7 +75,7 @@ def compute_clip_loss(
     variant_axes=None,
     l2_reg_weight=0.01,
     lambda_clip=2.0,
-    lambda_l1=0.2,
+    lambda_l1=0.1,
     sam_checkpoint=None,
     sam_model_type="vit_h",
     sam_background_dir=None,
@@ -126,11 +126,11 @@ def optimize_perturbed_image(
     guidance_scale=4.5,
     seed=10,
     num_iterations=10,
-    learning_rate=2e-4,
+    learning_rate=5e-4,
     lambda_clip=2.0,
     lambda_l1=0.1,
     l2_reg_weight=0.01,
-    max_grad_norm=1.0,
+    max_grad_norm=5.0,
     max_variant_norm=0.20,
     output_folder=None,
 ):
@@ -323,7 +323,7 @@ if __name__ == "__main__":
     print("Optimizing variant_axes")
     print(f"{'='*60}")
 
-    base_image_path = os.path.join(input_folder, "n02111889_7148_n.png")
+    base_image_path = os.path.join(input_folder, "n02112350_520.JPEG")
     prompt_img1 = Image.open(base_image_path)
 
     generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
@@ -331,11 +331,11 @@ if __name__ == "__main__":
         guidance_scale=4.5,
         seed=10,
         num_iterations=400,
-        learning_rate=2e-4,
+        learning_rate=5e-4,
         lambda_clip=3.0,
-        lambda_l1=0.2,
+        lambda_l1=0.1,
         l2_reg_weight=0.01,
-        max_grad_norm=1.0,
+        max_grad_norm=5.0,
         max_variant_norm=0.20,
         output_folder=output_root
     )

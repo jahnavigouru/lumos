@@ -550,7 +550,7 @@ if __name__ == "__main__":
                             INTERPRETATION=INTERPRETATION,
                             img_per=True
                         )
-                    else:
+                    elif LEARN_EMB_PERTURBATION:
                         result_input, result_output = generate(
                             prompt_img1=prompt_img1,
                             prompt_img2=None,
@@ -561,7 +561,9 @@ if __name__ == "__main__":
                             randomize_seed=randomize_seed,
                             method=method,
                             INTERPRETATION=INTERPRETATION,
-                            img_per=False
+                            img_per=False,
+                            mask_per=True,
+                            g_per=True
                         )
 
                     method_output_filename = f"{base_name}_{method}.png"
