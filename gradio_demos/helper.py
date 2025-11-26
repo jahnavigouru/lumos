@@ -28,6 +28,8 @@ def get_sam_loss(
     background_dir=None,
     checkpoints_root=None,
     save_every: int = 1,
+    clip_model=None,
+    clip_processor=None,
 ):
     """
     Lazily initialize and cache SAMLoss.
@@ -36,6 +38,8 @@ def get_sam_loss(
     - device: torch device string; defaults to CUDA if available.
     - background_dir: optional dir to save background-only images from SAMLoss.
     - checkpoints_root: base dir containing checkpoints/; defaults to repo root.
+    - clip_model: Optional CLIP model for best_mask functionality.
+    - clip_processor: Optional CLIP processor for best_mask functionality.
     """
     base_root = (
         checkpoints_root
@@ -47,9 +51,16 @@ def get_sam_loss(
         filename = _SAM_CKPT_FILENAMES.get(sam_model_type, _SAM_CKPT_FILENAMES["vit_h"])
         sam_checkpoint = os.path.join(base_root, "checkpoints", filename)
 
+    # Create cache key based on SAM parameters
     key = (sam_model_type, sam_checkpoint)
     if key in _SAM_LOSS_CACHE:
-        return _SAM_LOSS_CACHE[key]
+        cached_instance = _SAM_LOSS_CACHE[key]
+        # Update CLIP components if provided and not already set
+        if clip_model is not None and cached_instance.clip_model is None:
+            cached_instance.clip_model = clip_model
+        if clip_processor is not None and cached_instance.clip_processor is None:
+            cached_instance.clip_processor = clip_processor
+        return cached_instance
 
     if not os.path.exists(sam_checkpoint):
         print(f"[warn] SAM checkpoint not found at {sam_checkpoint}; skipping SAM loss.")
@@ -61,6 +72,8 @@ def get_sam_loss(
             device=device,
             save_background_dir=background_dir,
             save_every=save_every,
+            clip_model=clip_model,
+            clip_processor=clip_processor,
         )
         _SAM_LOSS_CACHE[key] = sam_loss
         return sam_loss

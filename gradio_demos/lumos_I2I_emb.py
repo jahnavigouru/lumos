@@ -26,7 +26,7 @@ from helper import create_combined_image_with_labels, freeze_model_parameters, c
 from loss import DirectionLoss, CLIPLoss
 
 src_txt = "brown dog"
-trg_txt = "white dog"
+trg_txt = "black dog"
 
 def generate_perturbed_image(
     embeddings,
@@ -65,6 +65,52 @@ def generate_perturbed_image(
     
     return output
 
+def plot_per_dimension_l1_change(caption_emb, perturbed_emb, output_path=None):
+    """
+    Plot per-dimension L1 change between caption_emb and perturbed_emb.
+    
+    Args:
+        caption_emb: Original caption embedding tensor
+        perturbed_emb: Perturbed embedding tensor
+        output_path: Optional path to save the plot
+    """
+    # Flatten embeddings to 1D for comparison
+    caption_flat = caption_emb.flatten().detach().cpu().numpy()
+    perturbed_flat = perturbed_emb.flatten().detach().cpu().numpy()
+    
+    # Compute per-dimension L1 change
+    l1_changes = np.abs(perturbed_flat - caption_flat)
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    dimensions = np.arange(len(l1_changes))
+    ax.plot(dimensions, l1_changes, linewidth=0.5, alpha=0.7)
+    ax.set_xlabel('Dimension Index', fontsize=12)
+    ax.set_ylabel('L1 Change (|perturbed - original|)', fontsize=12)
+    ax.set_title('Per-Dimension L1 Change: Perturbed Embedding vs Original Caption Embedding', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    
+    # Add statistics text
+    stats_text = f'Mean L1: {l1_changes.mean():.6f}\n'
+    stats_text += f'Max L1: {l1_changes.max():.6f}\n'
+    stats_text += f'Min L1: {l1_changes.min():.6f}\n'
+    stats_text += f'Std L1: {l1_changes.std():.6f}'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+            fontsize=10)
+    
+    plt.tight_layout()
+    
+    if output_path is not None:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Per-dimension L1 change plot saved to {output_path}")
+    else:
+        # Save to a default location if output_folder is available
+        plt.savefig('per_dimension_l1_change.png', dpi=150, bbox_inches='tight')
+        print("Per-dimension L1 change plot saved to per_dimension_l1_change.png")
+    
+    plt.close()
+
 def compute_clip_loss(
     original_image,
     generated_image,
@@ -75,7 +121,7 @@ def compute_clip_loss(
     variant_axes=None,
     l2_reg_weight=0.01,
     lambda_clip=2.0,
-    lambda_l1=0.1,
+    lambda_l1=1.0,
     sam_checkpoint=None,
     sam_model_type="vit_h",
     sam_background_dir=None,
@@ -98,6 +144,8 @@ def compute_clip_loss(
         background_dir=sam_background_dir,
         checkpoints_root=os.path.dirname(project_root),
         save_every=sam_save_every,
+        clip_model=clip_model,
+        clip_processor=processor,
     )
     if sam_loss is not None:
         try:
@@ -128,9 +176,9 @@ def optimize_perturbed_image(
     num_iterations=10,
     learning_rate=5e-4,
     lambda_clip=2.0,
-    lambda_l1=0.1,
+    lambda_l1=1.0,
     l2_reg_weight=0.01,
-    max_grad_norm=5.0,
+    max_grad_norm=10.0,
     max_variant_norm=0.20,
     output_folder=None,
 ):
@@ -215,7 +263,8 @@ def optimize_perturbed_image(
             sam_checkpoint=os.path.join(os.path.dirname(project_root), "checkpoints", "sam_vit_h_4b8939.pth"),
             sam_model_type="vit_h",
             sam_background_dir=os.path.join(output_folder, "sam_backgrounds") if output_folder else None,
-            sam_save_every=10 if num_iterations > 100 else 1,
+            # Save masks every iteration (previously skipped to every 10th when >100 iters)
+            sam_save_every=1,
         )
         
         total_loss.backward()
@@ -256,6 +305,12 @@ def optimize_perturbed_image(
             guidance_scale=guidance_scale,
             seed=seed
         )
+        
+        # Plot per-dimension L1 change
+        plot_output_path = None
+        if output_folder is not None:
+            plot_output_path = os.path.join(output_folder, "per_dimension_l1_change.png")
+        plot_per_dimension_l1_change(caption_emb, perturbed_emb, output_path=plot_output_path)
     
     return generated_image, variant_axes, loss_history, iteration_images
 
@@ -333,7 +388,7 @@ if __name__ == "__main__":
         num_iterations=400,
         learning_rate=5e-4,
         lambda_clip=3.0,
-        lambda_l1=0.1,
+        lambda_l1=1.0,
         l2_reg_weight=0.01,
         max_grad_norm=5.0,
         max_variant_norm=0.20,

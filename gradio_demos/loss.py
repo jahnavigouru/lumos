@@ -112,6 +112,8 @@ class SAMLoss(torch.nn.Module):
         device: str = None,
         save_background_dir: str = None,
         save_every: int = 1,
+        clip_model=None,
+        clip_processor=None,
     ):
         super().__init__()
         if not _SAM_AVAILABLE:
@@ -133,6 +135,94 @@ class SAMLoss(torch.nn.Module):
         # Cache for original image mask (img_a is always the original image)
         self._cached_original_mask = None
         self._cached_original_num_masks = None
+        # CLIP components for mask scoring
+        self.clip_model = clip_model
+        self.clip_processor = clip_processor
+
+    def best_mask(
+        self,
+        img,
+        text="dog",
+        min_area_ratio: float = 0.01,
+        area_bonus: float = 0.5,
+        score_floor: float = None,
+    ):
+        if self.clip_model is None or self.clip_processor is None:
+            raise ValueError("CLIP model and processor must be provided to SAMLoss for best_mask method")
+        
+        img_np = img.detach().permute(1, 2, 0).cpu().numpy()
+        masks = self.mask_generator.generate(img_np)
+        num_masks = len(masks)
+        if num_masks == 0:
+            return None
+        
+        h, w, _ = img_np.shape
+        total_area = float(h * w)
+        # Prepare text for CLIP
+        text_inputs = self.clip_processor(text=[text], return_tensors="pt", padding=True)
+        text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+        
+        with torch.no_grad():
+            text_features = self.clip_model.get_text_features(
+                input_ids=text_inputs['input_ids'],
+                attention_mask=text_inputs['attention_mask']
+            )
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        
+        best_score = float("-inf")
+        best_mask = None
+        best_area_ratio = 0.0
+        
+        # Convert image to tensor if needed
+        img_tensor = img.to(self.device)
+        if img_tensor.dim() == 3:
+            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+        
+        # Compare each mask with CLIP score
+        for mask_data in masks:
+            mask = mask_data["segmentation"].astype(bool)
+            area_ratio = mask.sum() / total_area
+            if area_ratio < min_area_ratio:
+                # Drop tiny masks (e.g., just a nose) that dominate by CLIP score but are not foreground
+                continue
+            
+            # Create masked image (set background to 0)
+            masked_img_np = img_np.copy()
+            masked_img_np[~mask] = 0
+            
+            # Convert to tensor and prepare for CLIP
+            masked_img_tensor = torch.from_numpy(masked_img_np).permute(2, 0, 1).float().to(self.device)
+            if masked_img_tensor.max() <= 1.5:
+                masked_img_tensor = masked_img_tensor / 255.0
+            masked_img_tensor = masked_img_tensor.unsqueeze(0)  # Add batch dimension
+            
+            # Prepare image for CLIP
+            mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
+            masked_img_tensor = torch.nn.functional.interpolate(masked_img_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+            masked_img_tensor = (masked_img_tensor - mean) / std
+            
+            # Get image features
+            with torch.no_grad():
+                image_features = self.clip_model.get_image_features(pixel_values=masked_img_tensor)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            
+            # Compute cosine similarity (CLIP score)
+            similarity = (image_features * text_features).sum(dim=-1).item()
+            # Encourage larger masks that still match the text
+            score = similarity + area_bonus * area_ratio
+            
+            if score > best_score:
+                best_score = score
+                best_mask = mask
+                best_area_ratio = area_ratio
+        
+        if score_floor is not None and best_score < score_floor:
+            print(f"Best mask rejected (score {best_score:.4f} below floor {score_floor:.4f})")
+            return None, best_score, best_area_ratio
+
+        print(f"Best mask selected with score: {best_score:.4f} (area_ratio bonus applied, area_ratio={best_area_ratio:.3f}) for text: '{text}'")
+        return best_mask, best_score, best_area_ratio
 
     def _largest_mask(self, img: torch.Tensor, return_count=False):
         """
@@ -165,8 +255,9 @@ class SAMLoss(torch.nn.Module):
         fname = f"{label}_background_{self._save_idx:04d}.png"
         Image.fromarray(bg_img).save(os.path.join(self.save_background_dir, fname))
 
-    def _background_l1(self, img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
+    def _background_l1(self, img_a: torch.Tensor, img_b: torch.Tensor, text="dog") -> torch.Tensor:
         # Use cached mask for original image (img_a) if available, otherwise compute and cache it
+        # The mask is computed ONLY ONCE for img_a and reused for all iterations
         if self._cached_original_mask is None:
             mask_a, num_masks_a = self._largest_mask(img_a, return_count=True)
             self._cached_original_mask = mask_a
@@ -177,39 +268,91 @@ class SAMLoss(torch.nn.Module):
             num_masks_a = self._cached_original_num_masks
             print(f"SAMLoss: Using cached original image mask (img_a) - {num_masks_a} masks")
         
-        # Always recompute mask for generated image (img_b) since it changes each iteration
-        mask_b, num_masks_b = self._largest_mask(img_b, return_count=True)
-        print(f"SAMLoss: img_b (generated) has {num_masks_b} masks")
+        # Prefer CLIP-guided best_mask for generated image (img_b) so the dog stays foreground.
+        mask_b = None
+        num_masks_b = None
+        if self.clip_model is not None and self.clip_processor is not None:
+            try:
+                mask_b, best_score, best_area_ratio = self.best_mask(
+                    img_b,
+                    text=text,
+                    min_area_ratio=0.15,  # demand a reasonably sized dog mask
+                    area_bonus=1.0,
+                    score_floor=None,  # optional: set to e.g., 0.05 to reject weak matches
+                )
+                num_masks_b = -1  # indicator for "CLIP best mask"
+                print(f"SAMLoss: Using best_mask for img_b (generated) with text: '{text}', area_ratio={best_area_ratio:.3f}, score={best_score:.4f}")
+            except Exception as exc:
+                print(f"[warn] SAMLoss best_mask failed ({exc}); falling back to largest mask.")
+        # Fallback to largest mask if CLIP not available or failed
+        if mask_b is None:
+            mask_b, num_masks_b = self._largest_mask(img_b, return_count=True)
+            print(f"SAMLoss: img_b (generated) has {num_masks_b} masks (using largest mask)")
 
         # Fallback to full L1 if either mask is missing
         if mask_a is None or mask_b is None:
             print("[warn] SAMLoss: missing mask (mask_a or mask_b is None); falling back to full L1.")
             return self.l1(img_a, img_b)
 
-        background = ~(mask_a | mask_b)
-        if not background.any():
-            print("[warn] SAMLoss: background empty after combining masks; falling back to full L1.")
+        # Invert each mask separately to get background regions
+        background_a = ~mask_a  # Background of img_a
+        background_b = ~mask_b  # Background of img_b
+        
+        # Check if backgrounds are empty
+        if not background_a.any():
+            print("[warn] SAMLoss: background_a empty; falling back to full L1.")
+            return self.l1(img_a, img_b)
+        if not background_b.any():
+            print("[warn] SAMLoss: background_b empty; falling back to full L1.")
             return self.l1(img_a, img_b)
 
-        background_mask = torch.from_numpy(background).to(img_a.device, dtype=img_a.dtype)
-        background_mask = background_mask.unsqueeze(0)  # broadcast over channels
+        # Convert to tensors and prepare for broadcasting
+        background_mask_a = torch.from_numpy(background_a).to(img_a.device, dtype=img_a.dtype)
+        background_mask_b = torch.from_numpy(background_b).to(img_b.device, dtype=img_b.dtype)
+        
+        # Add channel dimension for broadcasting: (H, W) -> (1, H, W)
+        if background_mask_a.dim() == 2:
+            background_mask_a = background_mask_a.unsqueeze(0)
+        if background_mask_b.dim() == 2:
+            background_mask_b = background_mask_b.unsqueeze(0)
 
         # Optionally save background-only visualizations for inspection
         if self._save_idx % self.save_every == 0:
-            self._save_background_image(img_a, background, "img_a")
-            self._save_background_image(img_b, background, "img_b")
+            self._save_background_image(img_a, background_a, "img_a")
+            self._save_background_image(img_b, background_b, "img_b")
         self._save_idx += 1
 
-        return self.l1(img_a * background_mask, img_b * background_mask)
+        # Compute L1 loss between the background regions of each image
+        # Normalize by number of background pixels instead of mean over all pixels
+        masked_img_a = img_a * background_mask_a
+        masked_img_b = img_b * background_mask_b
+        
+        # Compute L1 difference
+        l1_diff = torch.abs(masked_img_a - masked_img_b)
+        
+        # Count background pixels (use intersection of both background masks for normalization)
+        # This ensures we normalize by pixels that are background in both images
+        background_intersection = background_mask_a * background_mask_b
+        num_background_pixels = background_intersection.sum()
+        
+        if num_background_pixels > 0:
+            # Sum over all dimensions and normalize by number of background pixels
+            loss = l1_diff.sum() / num_background_pixels
+        else:
+            # Fallback to mean if no background pixels
+            loss = l1_diff.mean()
+        
+        return loss
 
-    def forward(self, img_a: torch.Tensor, img_b: torch.Tensor) -> torch.Tensor:
+    def forward(self, img_a: torch.Tensor, img_b: torch.Tensor, text="dog") -> torch.Tensor:
         """
         img_a, img_b: tensors shaped (C, H, W) or (B, C, H, W)
+        text: Text to use for best_mask selection on img_b (default: "dog")
         """
         if img_a.dim() == 4:
             if img_a.shape[0] != img_b.shape[0]:
                 raise ValueError("Batch size mismatch between img_a and img_b.")
-            losses = [self._background_l1(a, b) for a, b in zip(img_a, img_b)]
+            losses = [self._background_l1(a, b, text=text) for a, b in zip(img_a, img_b)]
             return torch.stack(losses).mean()
 
-        return self._background_l1(img_a, img_b)
+        return self._background_l1(img_a, img_b, text=text)
