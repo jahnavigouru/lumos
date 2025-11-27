@@ -18,15 +18,12 @@ import torchvision.transforms as T
 from lumos_diffusion.model.lumos import LumosI2I_XL_2
 from utils import find_model
 from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-from transformers import CLIPModel, CLIPProcessor
-from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform, get_sam_loss
-from loss import DirectionLoss, CLIPLoss
+from helper import create_combined_image_with_labels, freeze_model_parameters, create_transform
+from sam import Segmentation
 
 src_txt = "brown dog"
 trg_txt = "black dog"
+query_txt = "dog"
 
 def generate_perturbed_image(
     embeddings,
@@ -60,112 +57,84 @@ def generate_perturbed_image(
             skip_type="time_uniform",
             method="multistep",
             enable_grad=enable_grad)
-    output = vae.decode(output / 0.18215).sample
+    
+    # Ensure VAE decode preserves gradients
+    if enable_grad and embeddings.requires_grad:
+        # VAE should preserve gradients through forward pass even in eval mode
+        # Only check gradients if embeddings actually require them
+        vae_input = output / 0.18215
+        # Check if vae_input has gradients (from dpm_solver output)
+        if not vae_input.requires_grad:
+            raise RuntimeError(
+                f"VAE input does not require gradients. "
+                f"This means gradients were lost in dpm_solver.sample(). "
+                f"embeddings.requires_grad: {embeddings.requires_grad}"
+            )
+        vae_output = vae.decode(vae_input)
+        output = vae_output.sample
+        # Verify output has gradients after VAE decode
+        if not output.requires_grad:
+            raise RuntimeError(
+                f"VAE output does not require gradients after decode. "
+                f"vae_input.requires_grad: {vae_input.requires_grad}, "
+                f"vae.eval(): {not vae.training}"
+            )
+    else:
+        # If enable_grad=False or embeddings don't require grad, decode without gradient tracking
+        with torch.no_grad():
+            output = vae.decode(output / 0.18215).sample
+    
     output = torch.clamp(output * 0.5 + 0.5, min=0, max=1)
     
     return output
 
-def plot_per_dimension_l1_change(caption_emb, perturbed_emb, output_path=None):
-    """
-    Plot per-dimension L1 change between caption_emb and perturbed_emb.
-    
-    Args:
-        caption_emb: Original caption embedding tensor
-        perturbed_emb: Perturbed embedding tensor
-        output_path: Optional path to save the plot
-    """
-    # Flatten embeddings to 1D for comparison
-    caption_flat = caption_emb.flatten().detach().cpu().numpy()
-    perturbed_flat = perturbed_emb.flatten().detach().cpu().numpy()
-    
-    # Compute per-dimension L1 change
-    l1_changes = np.abs(perturbed_flat - caption_flat)
-    
-    # Create the plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    dimensions = np.arange(len(l1_changes))
-    ax.plot(dimensions, l1_changes, linewidth=0.5, alpha=0.7)
-    ax.set_xlabel('Dimension Index', fontsize=12)
-    ax.set_ylabel('L1 Change (|perturbed - original|)', fontsize=12)
-    ax.set_title('Per-Dimension L1 Change: Perturbed Embedding vs Original Caption Embedding', fontsize=14)
-    ax.grid(True, alpha=0.3)
-    
-    # Add statistics text
-    stats_text = f'Mean L1: {l1_changes.mean():.6f}\n'
-    stats_text += f'Max L1: {l1_changes.max():.6f}\n'
-    stats_text += f'Min L1: {l1_changes.min():.6f}\n'
-    stats_text += f'Std L1: {l1_changes.std():.6f}'
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-            fontsize=10)
-    
-    plt.tight_layout()
-    
-    if output_path is not None:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Per-dimension L1 change plot saved to {output_path}")
-    else:
-        # Save to a default location if output_folder is available
-        plt.savefig('per_dimension_l1_change.png', dpi=150, bbox_inches='tight')
-        print("Per-dimension L1 change plot saved to per_dimension_l1_change.png")
-    
-    plt.close()
+# Global Segmentation instance (initialized on first use)
+_segmentation_instance = None
 
-def compute_clip_loss(
+def compute_total_loss(
     original_image,
     generated_image,
-    clip_model,
-    processor,
     device=None,
-    lambda_direction=1.0,
-    variant_axes=None,
-    l2_reg_weight=0.01,
     lambda_clip=2.0,
     lambda_l1=1.0,
     sam_checkpoint=None,
     sam_model_type="vit_h",
-    sam_background_dir=None,
-    sam_save_every: int = 1,
+    query_text=None,
+    target_text=None,
 ):
-    x0 = original_image
-    x = generated_image
-
-    clip_loss_func = CLIPLoss(clip_model, processor, loss_type='cosine', lambda_direction=lambda_direction)
-    clip_loss_value = clip_loss_func(x0, src_txt, x, trg_txt, device=device)
+    global _segmentation_instance
     
-    loss_clip = (2 - clip_loss_value) / 2
-    loss_clip = -torch.log(loss_clip)
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    loss_l1 = None
-    sam_loss = get_sam_loss(
-        sam_checkpoint=sam_checkpoint,
-        sam_model_type=sam_model_type,
-        device=device,
-        background_dir=sam_background_dir,
-        checkpoints_root=os.path.dirname(project_root),
-        save_every=sam_save_every,
-        clip_model=clip_model,
-        clip_processor=processor,
+    if _segmentation_instance is None:
+        if sam_checkpoint is None:
+            sam_checkpoint = os.path.join(os.path.dirname(project_root), "checkpoints", "sam_vit_h_4b8939.pth")
+        _segmentation_instance = Segmentation(
+            checkpoint_path=os.path.dirname(sam_checkpoint),
+            checkpoint_name=os.path.basename(sam_checkpoint),
+            model_type=sam_model_type,
+            device=str(device)
+        )
+    
+    if _segmentation_instance.init_image is None:
+        _segmentation_instance.set_init_image(original_image)
+    
+    if query_text is None:
+        query_text = query_txt
+    if target_text is None:
+        target_text = trg_txt
+    
+    # Pass tensor directly to preserve gradients
+    total_loss = _segmentation_instance.calculate_total_loss(
+        image=generated_image,
+        query_text=query_text,
+        target_text=target_text,
+        clip_guidance_lambda=lambda_clip * 1000,
+        range_lambda=50,
+        lpips_sim_lambda=lambda_l1 * 1000,
+        l2_sim_lambda=10000,
     )
-    if sam_loss is not None:
-        try:
-            loss_l1 = sam_loss(x0, x)
-            print(f"SAM Loss value: {loss_l1.item():.6f}")
-        except Exception as exc:
-            print(f"[warn] SAMLoss failed, using L1Loss instead: {exc}")
-            l1_loss_fn = nn.L1Loss()
-            loss_l1 = l1_loss_fn(x0, x)
-    else:
-        l1_loss_fn = nn.L1Loss()
-        loss_l1 = l1_loss_fn(x0, x)
-
-    total_loss = lambda_clip * loss_clip
-    if loss_l1 is not None:
-        total_loss = total_loss + lambda_l1 * loss_l1
-    
-    if variant_axes is not None and l2_reg_weight > 0:
-        l2_reg_loss = l2_reg_weight * torch.norm(variant_axes) ** 2
-        total_loss = total_loss + l2_reg_loss
     
     return total_loss
 
@@ -187,11 +156,6 @@ def optimize_perturbed_image(
     freeze_model_parameters(vae)
     freeze_model_parameters(dino)
     freeze_model_parameters(model)
-    
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    clip_model.eval()
-    freeze_model_parameters(clip_model)
 
     prompt_img1_tensor = transform(prompt_img1).unsqueeze(0)
     
@@ -199,10 +163,14 @@ def optimize_perturbed_image(
         caption_emb = dino(prompt_img1_tensor.to(device))
         caption_emb = torch.nn.functional.normalize(caption_emb, dim=-1).unsqueeze(1).unsqueeze(1)
     
-    # Set random seed for deterministic variant_axes initialization
     torch.manual_seed(seed)
     np.random.seed(seed)
     variant_axes = nn.Parameter(torch.randn_like(caption_emb) * 0.01).to(device)
+    variant_axes.requires_grad = True  # Explicitly ensure variant_axes requires gradients
+    
+    # Verify that only variant_axes requires gradients
+    trainable_params = sum(1 for p in [variant_axes] if p.requires_grad)
+    print(f"Number of trainable parameters: {trainable_params} (should be 1 for variant_axes)")
     
     optimizer = torch.optim.Adam([variant_axes], lr=learning_rate)
     
@@ -222,13 +190,12 @@ def optimize_perturbed_image(
     print(f"l2_reg_weight: {l2_reg_weight}, max_grad_norm: {max_grad_norm}, max variant norm: {max_variant_norm}")
     print(f"{'='*60}\n")
     
-    # Generate original image from original embedding for comparison
     with torch.no_grad():
         original_image = generate_perturbed_image(
             embeddings=caption_emb,
             guidance_scale=guidance_scale,
             seed=seed,
-            enable_grad=True
+            enable_grad=False  # original_image doesn't need gradients
         )
         if output_folder is not None:
             iter_image_copy = original_image[0].clone().cpu()
@@ -250,38 +217,41 @@ def optimize_perturbed_image(
             enable_grad=True
         )
         
-        total_loss = compute_clip_loss(
+        # Verify generated_image has gradients
+        if not generated_image.requires_grad:
+            raise RuntimeError(
+                f"generated_image does not require gradients after VAE decode. "
+                f"This breaks the computation graph. "
+                f"perturbed_emb.requires_grad: {perturbed_emb.requires_grad}, "
+                f"variant_axes.requires_grad: {variant_axes.requires_grad}"
+            )
+        
+        total_loss = compute_total_loss(
             original_image=original_image,
             generated_image=generated_image,
-            clip_model=clip_model,
-            processor=processor,
             device=device,
-            variant_axes=variant_axes,
-            l2_reg_weight=l2_reg_weight,
             lambda_clip=lambda_clip,
             lambda_l1=lambda_l1,
             sam_checkpoint=os.path.join(os.path.dirname(project_root), "checkpoints", "sam_vit_h_4b8939.pth"),
             sam_model_type="vit_h",
-            sam_background_dir=os.path.join(output_folder, "sam_backgrounds") if output_folder else None,
-            # Save masks every iteration (previously skipped to every 10th when >100 iters)
-            sam_save_every=1,
+            query_text=query_txt,
+            target_text=trg_txt,
         )
         
-        total_loss.backward()
-        if max_grad_norm is not None:
-            nn.utils.clip_grad_norm_([variant_axes], max_grad_norm)
+        # Verify total_loss has gradients before backward
+        if not total_loss.requires_grad:
+            raise RuntimeError(
+                f"total_loss does not require gradients. "
+                f"generated_image.requires_grad={generated_image.requires_grad}, "
+                f"total_loss.grad_fn={total_loss.grad_fn}"
+            )
         
+        total_loss.backward()
         optimizer.step()
-        # if max_variant_norm is not None:
-        #     with torch.no_grad():
-        #         current_norm = variant_axes.norm()
-        #         if current_norm > max_variant_norm:
-        #             variant_axes.mul_(max_variant_norm / (current_norm + 1e-6))
-         
+        
         loss_history.append(total_loss.item())
         print(f"Iteration {iteration + 1}/{num_iterations}: Total Loss = {total_loss.item():.6f}")
         
-        # Only persist every 10th image if training is long-running (>100 iters) to save space
         should_record_iteration = output_folder is None or num_iterations <= 100 or (iteration + 1) % 10 == 0
         should_save_iteration = output_folder is not None and should_record_iteration
         with torch.no_grad():
@@ -305,12 +275,6 @@ def optimize_perturbed_image(
             guidance_scale=guidance_scale,
             seed=seed
         )
-        
-        # Plot per-dimension L1 change
-        plot_output_path = None
-        if output_folder is not None:
-            plot_output_path = os.path.join(output_folder, "per_dimension_l1_change.png")
-        plot_per_dimension_l1_change(caption_emb, perturbed_emb, output_path=plot_output_path)
     
     return generated_image, variant_axes, loss_history, iteration_images
 

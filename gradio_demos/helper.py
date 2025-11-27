@@ -1,85 +1,14 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import torch.nn as nn
 import torchvision.transforms as T
-from PIL import Image
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from loss import SAMLoss
 try:
     import umap
     UMAP_AVAILABLE = True
 except ImportError:
     UMAP_AVAILABLE = False
-
-_SAM_CKPT_FILENAMES = {
-    "vit_h": "sam_vit_h_4b8939.pth",
-    "vit_l": "sam_vit_l_0b3195.pth",
-    "vit_b": "sam_vit_b_01ec64.pth",
-}
-_SAM_LOSS_CACHE = {}
-
-
-def get_sam_loss(
-    sam_checkpoint=None,
-    sam_model_type="vit_h",
-    device=None,
-    background_dir=None,
-    checkpoints_root=None,
-    save_every: int = 1,
-    clip_model=None,
-    clip_processor=None,
-):
-    """
-    Lazily initialize and cache SAMLoss.
-    - sam_checkpoint: explicit checkpoint path; if None, use checkpoints_root + filename.
-    - sam_model_type: one of vit_h/vit_l/vit_b.
-    - device: torch device string; defaults to CUDA if available.
-    - background_dir: optional dir to save background-only images from SAMLoss.
-    - checkpoints_root: base dir containing checkpoints/; defaults to repo root.
-    - clip_model: Optional CLIP model for best_mask functionality.
-    - clip_processor: Optional CLIP processor for best_mask functionality.
-    """
-    base_root = (
-        checkpoints_root
-        if checkpoints_root is not None
-        else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    )
-
-    if sam_checkpoint is None:
-        filename = _SAM_CKPT_FILENAMES.get(sam_model_type, _SAM_CKPT_FILENAMES["vit_h"])
-        sam_checkpoint = os.path.join(base_root, "checkpoints", filename)
-
-    # Create cache key based on SAM parameters
-    key = (sam_model_type, sam_checkpoint)
-    if key in _SAM_LOSS_CACHE:
-        cached_instance = _SAM_LOSS_CACHE[key]
-        # Update CLIP components if provided and not already set
-        if clip_model is not None and cached_instance.clip_model is None:
-            cached_instance.clip_model = clip_model
-        if clip_processor is not None and cached_instance.clip_processor is None:
-            cached_instance.clip_processor = clip_processor
-        return cached_instance
-
-    if not os.path.exists(sam_checkpoint):
-        print(f"[warn] SAM checkpoint not found at {sam_checkpoint}; skipping SAM loss.")
-        return None
-    try:
-        sam_loss = SAMLoss(
-            model_type=sam_model_type,
-            checkpoint=sam_checkpoint,
-            device=device,
-            save_background_dir=background_dir,
-            save_every=save_every,
-            clip_model=clip_model,
-            clip_processor=clip_processor,
-        )
-        _SAM_LOSS_CACHE[key] = sam_loss
-        return sam_loss
-    except Exception as exc:
-        print(f"[warn] Failed to initialize SAMLoss ({exc}); skipping SAM loss.")
-        return None
 
 def create_transform(learn_img_perturbation=False):
     if not learn_img_perturbation:
@@ -122,36 +51,6 @@ def create_combined_image_with_labels(input_image, output_image, output_path):
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-
-def save_iteration_image(image_tensor, iteration_folder, filename, print_message=None):
-    """
-    Save an image tensor to disk as a PNG file in the iteration folder.
-    
-    Args:
-        image_tensor: torch.Tensor - Image tensor of shape (C, H, W) or (B, C, H, W)
-        iteration_folder: str - Path to the iteration folder where image will be saved
-        filename: str - Filename to save the image as (e.g., "iteration_000.png")
-        print_message: str or None - Optional message to print after saving
-    """
-    os.makedirs(iteration_folder, exist_ok=True)
-    
-    # Handle batch dimension if present
-    if image_tensor.dim() == 4:
-        image_tensor = image_tensor[0]
-    
-    # Convert tensor to PIL Image
-    image_copy = image_tensor.clone().cpu()
-    image_np = (image_copy.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    image_pil = Image.fromarray(image_np)
-    
-    # Save image
-    image_path = os.path.join(iteration_folder, filename)
-    image_pil.save(image_path)
-    
-    if print_message is not None:
-        print(print_message)
-    
-    return image_pil
 
 def plot_all_trajectories(trajectory_map, output_dir=None, methods=['PCA', 'TSNE', 'UMAP']):
     """
