@@ -1,9 +1,11 @@
 import os
 import urllib
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Tuple, Union
 
 import clip
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import PIL
 import torch
@@ -11,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from helper import save_mask, save_augmented_images, save_background_comparison_grid
 
 try:
     import kornia.augmentation as K
@@ -114,8 +117,9 @@ class Segmentation:
         
         self.lpips_model = None
         self.init_image = None
+        self.init_image_bg = None
     
-    def set_init_image(self, init_image_tensor: torch.Tensor):
+    def set_init_image(self, init_image_tensor: torch.Tensor, query_text: str = None):
         if init_image_tensor.dim() == 3:
             init_image_tensor = init_image_tensor.unsqueeze(0)
         
@@ -125,6 +129,36 @@ class Segmentation:
             init_image_tensor = init_image_tensor.mul(2).sub(1)
         
         self.init_image = init_image_tensor
+        
+        # Create background mask and extract background portion
+        if query_text is not None:
+            # Convert tensor to numpy array for mask calculation
+            init_image_np = init_image_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
+            init_image_np = ((init_image_np + 1) / 2).clip(0, 1)
+            init_image_np = (init_image_np * 255).astype(np.uint8)
+            init_image_pil = PIL.Image.fromarray(init_image_np)
+            
+            # Calculate mask using query text
+            mask_result = self.calculate_mask(
+                image=init_image_pil,
+                text=query_text,
+                predicted_iou_threshold=0.9,
+                stability_score_threshold=0.8,
+                clip_threshold=0.85,
+            )
+            
+            # Get background mask
+            background_mask = mask_result["background_mask"]
+            
+            # Convert background mask to tensor format
+            background_mask_tensor = torch.from_numpy(background_mask.astype(np.float32)).to(self.device)
+            background_mask_tensor = background_mask_tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+            
+            # Apply background mask to init_image to get background portion
+            self.init_image_bg = init_image_tensor * background_mask_tensor
+        else:
+            # If no query text, set to None or empty tensor
+            self.init_image_bg = None
         
     def _load_lpips_model(self):
         if not LPIPS_AVAILABLE:
@@ -331,11 +365,10 @@ class Segmentation:
         range_lambda: float = 50,
         lpips_sim_lambda: float = 1000,
         l2_sim_lambda: float = 10000,
+        iteration: int = None,
     ) -> torch.Tensor:
-        # Handle tensor input (preserve gradients)
         image_tensor = None
         if isinstance(image, torch.Tensor):
-            # If tensor is provided, use it directly for loss computation
             if image.dim() == 4:  # [B, C, H, W]
                 image_tensor = image.to(self.device)
             elif image.dim() == 3:  # [C, H, W]
@@ -343,11 +376,9 @@ class Segmentation:
             else:
                 raise ValueError(f"Unsupported tensor shape: {image.shape}")
             
-            # Normalize tensor if needed (assuming it's in [0, 1] range)
             if image_tensor.min() >= 0 and image_tensor.max() <= 1:
                 image_tensor = image_tensor.mul(2).sub(1)
             
-            # Convert to numpy/PIL for mask calculation (detached copy)
             image_np = image_tensor[0].detach().cpu().permute(1, 2, 0).numpy()
             image_np = ((image_np + 1) / 2).clip(0, 1)
             image_np = (image_np * 255).astype(np.uint8)
@@ -363,13 +394,17 @@ class Segmentation:
             clip_threshold=clip_threshold,
         )
         
+        # Store masks as instance variables
+        self.foreground_mask = result["foreground_mask"]
+        self.background_mask = result["background_mask"]
+        
+        # Save masks to output/sam folder
+        save_mask(result, original_image=image_for_mask, iteration=iteration)
+        
         foreground_mask = result["foreground_mask"]
         
-        # Use the tensor directly if provided, otherwise convert from image
         if image_tensor is not None:
             x_tensor = image_tensor
-            # x_tensor should inherit requires_grad from image_tensor
-            # For init_image, use a detached copy of the tensor
             if self.init_image is None:
                 self.init_image = x_tensor.detach().clone()
         else:
@@ -416,7 +451,6 @@ class Segmentation:
         mask_expanded = foreground_mask_tensor.unsqueeze(0).unsqueeze(0)
         masked_input_tensor = x_tensor * mask_expanded
         
-        # Verify x_tensor has gradients (critical for gradient flow)
         if not x_tensor.requires_grad:
             raise RuntimeError(
                 f"x_tensor does not require gradients. "
@@ -431,9 +465,6 @@ class Segmentation:
         clip_in = self.clip_normalize(augmented_input)
         
         clip_model, _ = self._load_clip()
-        # Ensure gradients flow through CLIP model
-        # Even though CLIP params don't require grad, we need gradients through the forward pass
-        # CLIP model in eval mode should still preserve gradients through forward pass
         image_embeds = clip_model.encode_image(clip_in).float()
         text_tokens = clip.tokenize([target_text]).to(self.device)
         text_embeds = clip_model.encode_text(text_tokens).float()
@@ -441,38 +472,60 @@ class Segmentation:
         dist = Losses.d_clip_loss(image_embeds, text_embeds, use_cosine=False)
         
         batch_size = masked_input_tensor.shape[0]
-        # Initialize with a value that has gradients
+        num_augmented = augmented_input.shape[0]
+        
+        # Save augmented images to output/sam folder
+        # self.save_augmented_images(
+        #     augmented_input=augmented_input,
+        #     dist=dist,
+        #     batch_size=batch_size,
+        #     iteration=iteration
+        # )
+        
         if batch_size > 0:
             clip_loss = dist[0 :: batch_size].mean()
             for i in range(1, batch_size):
                 clip_loss = clip_loss + dist[i :: batch_size].mean()
         else:
-            # Fallback: create a tensor that requires grad from x_tensor
-            # This should not happen in practice, but handle edge case
             clip_loss = (x_tensor * 0.0).sum() if x_tensor.requires_grad else torch.tensor(0.0, device=self.device, requires_grad=True)
         
         background_mask_expanded = background_mask_tensor.unsqueeze(0).unsqueeze(0)
         masked_bg_tensor = x_tensor * background_mask_expanded
         
-        range_loss_value = Losses.range_loss(x_tensor).sum()
+        # range_loss_value = Losses.range_loss(x_tensor).sum()
         
         lpips_model = self._load_lpips_model()
-        lpips_loss = lpips_model(masked_bg_tensor, self.init_image).sum()
+        init_bg_reference = self.init_image_bg if self.init_image_bg is not None else self.init_image
+        lpips_loss = lpips_model(masked_bg_tensor, init_bg_reference).sum()
         
-        l2_loss = F.mse_loss(masked_bg_tensor, self.init_image)
+        l2_loss = F.mse_loss(masked_bg_tensor, init_bg_reference)
         
-        # Initialize loss with a value that has gradients
-        # Use clip_loss as base (it always has gradients from x_tensor)
-        # Even if clip_guidance_lambda is 0, we multiply by 0.0 to preserve gradient graph
+        # Save background comparison grid
+        # save_background_comparison_grid(
+        #     x_tensor=x_tensor,
+        #     masked_bg_tensor=masked_bg_tensor,
+        #     init_image=self.init_image,
+        #     init_bg_reference=init_bg_reference,
+        #     iteration=iteration
+        # )
+        
         loss = clip_loss * clip_guidance_lambda
         
-        if range_lambda != 0:
-            loss = loss + range_loss_value * range_lambda
+        # if range_lambda != 0:
+        #     loss = loss + range_loss_value * range_lambda
         
         if lpips_sim_lambda != 0:
             loss = loss + lpips_loss * lpips_sim_lambda
         
         if l2_sim_lambda != 0:
             loss = loss + l2_loss * l2_sim_lambda
+        
+        # Print individual loss values
+        print(f"Loss values:")
+        print(f"  CLIP loss: {clip_loss.item():.6f} (weighted: {clip_loss.item() * clip_guidance_lambda:.6f})")
+        # print(f"  Range loss: {range_loss_value.item():.6f} (weighted: {range_loss_value.item() * range_lambda:.6f})")
+        print(f"  LPIPS loss: {lpips_loss.item():.6f} (weighted: {lpips_loss.item() * lpips_sim_lambda:.6f})")
+        print(f"  L2 loss: {l2_loss.item():.6f} (weighted: {l2_loss.item() * l2_sim_lambda:.6f})")
+        print(f"  Total loss: {loss.item():.6f}")
         
         return loss

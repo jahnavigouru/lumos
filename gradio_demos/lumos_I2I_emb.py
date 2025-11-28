@@ -22,7 +22,7 @@ from helper import create_combined_image_with_labels, freeze_model_parameters, c
 from sam import Segmentation
 
 src_txt = "brown dog"
-trg_txt = "black dog"
+trg_txt = "a picture of a black dog"
 query_txt = "dog"
 
 def generate_perturbed_image(
@@ -95,12 +95,15 @@ def compute_total_loss(
     original_image,
     generated_image,
     device=None,
-    lambda_clip=2.0,
-    lambda_l1=1.0,
+    clip_guidance_lambda=1000.0,
+    range_lambda=50.0,
+    lpips_sim_lambda=1000.0,
+    l2_sim_lambda=10000.0,
     sam_checkpoint=None,
     sam_model_type="vit_h",
     query_text=None,
     target_text=None,
+    iteration=None,
 ):
     global _segmentation_instance
     
@@ -117,23 +120,24 @@ def compute_total_loss(
             device=str(device)
         )
     
-    if _segmentation_instance.init_image is None:
-        _segmentation_instance.set_init_image(original_image)
-    
     if query_text is None:
         query_text = query_txt
     if target_text is None:
         target_text = trg_txt
+    
+    if _segmentation_instance.init_image is None:
+        _segmentation_instance.set_init_image(original_image, query_text=query_text)
     
     # Pass tensor directly to preserve gradients
     total_loss = _segmentation_instance.calculate_total_loss(
         image=generated_image,
         query_text=query_text,
         target_text=target_text,
-        clip_guidance_lambda=lambda_clip * 1000,
-        range_lambda=50,
-        lpips_sim_lambda=lambda_l1 * 1000,
-        l2_sim_lambda=10000,
+        clip_guidance_lambda=clip_guidance_lambda,
+        range_lambda=range_lambda,
+        lpips_sim_lambda=lpips_sim_lambda,
+        l2_sim_lambda=l2_sim_lambda,
+        iteration=iteration,
     )
     
     return total_loss
@@ -144,11 +148,10 @@ def optimize_perturbed_image(
     seed=10,
     num_iterations=10,
     learning_rate=5e-4,
-    lambda_clip=2.0,
-    lambda_l1=1.0,
-    l2_reg_weight=0.01,
-    max_grad_norm=10.0,
-    max_variant_norm=0.20,
+    clip_guidance_lambda=1000.0,
+    range_lambda=50.0,
+    lpips_sim_lambda=1000.0,
+    l2_sim_lambda=10000.0,
     output_folder=None,
 ):
     vae, dino, transform, model = models["vae"], models["vision_encoder"], models["transform"], models["diffusion"]
@@ -186,8 +189,9 @@ def optimize_perturbed_image(
     print(f"Training variant_axes for {num_iterations} iterations")
     print(f"Source text: {src_txt}")
     print(f"Target text: {trg_txt}")
-    print(f"Learning rate: {learning_rate}, lambda_clip: {lambda_clip}, lambda_l1: {lambda_l1}")
-    print(f"l2_reg_weight: {l2_reg_weight}, max_grad_norm: {max_grad_norm}, max variant norm: {max_variant_norm}")
+    print(f"Learning rate: {learning_rate}")
+    print(f"clip_guidance_lambda: {clip_guidance_lambda}, range_lambda: {range_lambda}")
+    print(f"lpips_sim_lambda: {lpips_sim_lambda}, l2_sim_lambda: {l2_sim_lambda}")
     print(f"{'='*60}\n")
     
     with torch.no_grad():
@@ -230,12 +234,15 @@ def optimize_perturbed_image(
             original_image=original_image,
             generated_image=generated_image,
             device=device,
-            lambda_clip=lambda_clip,
-            lambda_l1=lambda_l1,
+            clip_guidance_lambda=clip_guidance_lambda,
+            range_lambda=range_lambda,
+            lpips_sim_lambda=lpips_sim_lambda,
+            l2_sim_lambda=l2_sim_lambda,
             sam_checkpoint=os.path.join(os.path.dirname(project_root), "checkpoints", "sam_vit_h_4b8939.pth"),
             sam_model_type="vit_h",
             query_text=query_txt,
             target_text=trg_txt,
+            iteration=iteration,
         )
         
         # Verify total_loss has gradients before backward
@@ -342,20 +349,19 @@ if __name__ == "__main__":
     print("Optimizing variant_axes")
     print(f"{'='*60}")
 
-    base_image_path = os.path.join(input_folder, "n02112350_520.JPEG")
+    base_image_path = os.path.join(input_folder, "image.png")
     prompt_img1 = Image.open(base_image_path)
 
     generated_image, variant_axes, loss_history, iteration_images = optimize_perturbed_image(
         prompt_img1=prompt_img1,
         guidance_scale=4.5,
         seed=10,
-        num_iterations=400,
+        num_iterations=1500,
         learning_rate=5e-4,
-        lambda_clip=3.0,
-        lambda_l1=1.0,
-        l2_reg_weight=0.01,
-        max_grad_norm=5.0,
-        max_variant_norm=0.20,
+        clip_guidance_lambda=1000.0,
+        range_lambda=50.0,
+        lpips_sim_lambda=1000.0,
+        l2_sim_lambda=10000.0,
         output_folder=output_root
     )
 
